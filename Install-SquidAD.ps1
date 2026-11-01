@@ -54,7 +54,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$VersaoProjeto = '1.2.0'
+$VersaoProjeto = '1.3.0'
 $Aqui = Split-Path -Parent $MyInvocation.MyCommand.Definition
 # Padroes que costumam indicar grupo de SETOR (ex.: SETOR-FINANCEIRO, DEP_COMPRAS)
 $PadraoSetor = '^(SETOR|SET|DEP|DEPTO|DEPARTAMENTO|GRP|GG|GS)[-_ .]'
@@ -120,14 +120,16 @@ function Read-Valor([string]$Pergunta, [string]$Padrao, [scriptblock]$Valido = {
 function New-SenhaForte([int]$Tamanho = 32) {
     # Sem aspas, barra invertida, espaco nem $: a senha vai parar no squid.conf
     # e em linhas de comando do pfSense.
-    # Sem '#': no squidGuard.conf (ldapbindpass) ele pode virar inicio de comentario.
-    $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789-_.!@%+='
+    # So letras, numeros e - _ . : seguro em qualquer arquivo de configuracao
+    # (o squidGuard 1.4, por exemplo, quebrava com ! e @). 32 caracteres assim
+    # sao mais que suficientes, e cobrem 3 das 4 classes que o AD exige.
+    $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789-_.'
     $bytes = New-Object byte[] $Tamanho
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
     $s = -join ($bytes | ForEach-Object { $chars[$_ % $chars.Length] })
-    # garante as 4 classes que a politica de senha do AD costuma exigir
-    return 'Aa1!' + $s.Substring(4)
+    # garante maiuscula, minuscula, numero e simbolo (politica de senha do AD)
+    return 'Aa1-' + $s.Substring(4)
 }
 
 function ConvertTo-Pem([byte[]]$Der) {
@@ -239,7 +241,8 @@ function New-PacoteSquid($Dom, [string]$DcHost, [string]$DcIp, [int]$Porta, [str
         Conta    = [ordered]@{ Dn = $ContaDn; Usuario = $ContaUsuario; Senha = $ContaSenha }
         Filtro   = $Filtro
         Atributo = 'sAMAccountName'
-        Setores  = @($Setores | ForEach-Object { [ordered]@{ Nome = [string]$_.Name; Dn = [string]$_.DistinguishedName; Guid = (ConvertTo-GuidHex $_.ObjectGUID) } })
+        Setores  = @($Setores | ForEach-Object { [ordered]@{ Nome = [string]$_.Name; Dn = [string]$_.DistinguishedName; Guid = (ConvertTo-GuidHex $_.ObjectGUID)
+                                                       Membros = @(Get-MembrosAtivos $_) } })
         CaPem    = $CaPem
         Proxy    = $Proxy
         # BaseOu/Prefixo: o pfSense usa para buscar os grupos de setor sozinho (cron)
@@ -274,6 +277,14 @@ function ConvertTo-NomeSetor([string]$Nome) {
     $d = $Nome.Normalize([Text.NormalizationForm]::FormD)
     $sem = -join ($d.ToCharArray() | Where-Object { [Globalization.CharUnicodeInfo]::GetUnicodeCategory($_) -ne [Globalization.UnicodeCategory]::NonSpacingMark })
     return (($sem.ToUpperInvariant() -replace '[^A-Z0-9]+', '_').Trim('_'))
+}
+
+# sAMAccountName dos membros ATIVOS do grupo (inclusive por grupo dentro de grupo).
+# Vao no arquivo para o pfSense montar a regra do setor no SquidGuard.
+function Get-MembrosAtivos($Grupo) {
+    return @(Get-ADGroupMember -Identity $Grupo -Recursive | Where-Object { $_.objectClass -eq 'user' } |
+        ForEach-Object { Get-ADUser -Identity $_.distinguishedName } | Where-Object { $_.Enabled } |
+        ForEach-Object { [string]$_.SamAccountName } | Sort-Object -Unique)
 }
 
 # Junta as excecoes do proxy (padrao + extras), sem repetir e sem itens vazios.

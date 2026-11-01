@@ -41,7 +41,9 @@ bash tests/run-testes.sh      # precisa de pwsh, php (com ldap) e openssl
 |---|---|
 | Script do AD | leitura do certificado LDAPS (nome, curinga, nome errado, porta fechada, GUID do objeto no SAN), PEM validado pelo `openssl`, senha gerada, escape de filtro LDAP, perguntas S/N, IPs do controlador, nome do setor sem acento, GUID no formato do LDAP, espelhamento de membros e o `Sync-SetoresAD` inteiro contra um **AD simulado** (criar, mover usuário, exceção manual, OU nova), arquivo `.json` |
 | Contrato | o `.json` gerado pelo PowerShell é lido pelo PHP |
-| Script do pfSense | simular não muda nada; aplicar faz backup, CA, teste, config, SquidGuard e cron; reaplicar não duplica; senha errada não altera o Squid; nome da regra (16 caracteres); linha `ldapusersearch` decodificada de volta; sincronização (criar, mover, apagar, recriar, preservar restrições); AD fora do ar não muda nada; zero grupos para; relatório e CSV; desfazer volta tudo e mantém as regras manuais |
+| Script do pfSense | simular não muda nada; aplicar faz backup, CA, teste, config, SquidGuard e cron; reaplicar não duplica; senha errada não altera o Squid; nome da regra (16 caracteres); lista de usuários no formato que o pfSense valida; sincronização (criar, membros mudaram, vazio desativa/reativa, desativada pelo admin fica, apagar, recriar, preservar restrições); conferência com o squidGuard (squidGuard falso que acusa erro); AD fora do ar não muda nada; zero grupos para; relatório e CSV; desfazer volta tudo e mantém as regras manuais |
+
+Além dos testes automáticos, as decisões sobre o squidGuard foram **provadas no squidGuard 1.4 real** do pfSense 2.7.0, com cópias da configuração em `/tmp`: caracteres aceitos na senha, falta de LDAPS, formato `user` aceito, membro bloqueado e não membro liberado, maiúsculas indiferentes.
 
 **Não cobertos** (dependem de um AD e de um pfSense reais): o LDAPS do Windows de verdade, o `basic_ldap_auth` real e o `squid_resync()` real. Por isso o `aplicar` sempre testa com o helper real antes de mudar o Squid.
 

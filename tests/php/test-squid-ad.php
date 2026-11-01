@@ -23,6 +23,12 @@ define('SQAD_CONFIGXML',   "$W/config.xml");
 define('SQAD_VERSIONFILE', "$W/version");
 define('SQAD_SQUIDGUARDINC', "$W/squidguard.inc");
 define('SQAD_SCRIPT_FIXO', "$W/root-squid-ad.php");
+define('SQAD_SG_BIN', "$W/fake-squidguard.sh");
+define('SQAD_SG_CONF', "$W/squidGuard.conf");
+// squidGuard falso: acusa erro de sintaxe se a configuracao tiver QUEBRADO
+file_put_contents(SQAD_SG_BIN, "#!/bin/sh\ncat >/dev/null\nif grep -q QUEBRADO \"\$3\"; then echo '2026-11-01 [1] syntax error in configfile x line 11'; echo 'going into emergency mode'; fi\necho ERR\n");
+chmod(SQAD_SG_BIN, 0755);
+file_put_contents(SQAD_SG_CONF, "acl { default { pass all } }\n");
 
 /* ---------------- pfSense simulado ---------------- */
 $GLOBALS['cfg'] = [];
@@ -141,53 +147,83 @@ cenario('nome da regra: max 16, comeca com letra, sem reservados, unico', functi
 		confere(preg_match('/^[A-Za-z][A-Za-z0-9_-]{1,15}$/', $n) === 1, "formato invalido: $n");
 	}
 });
-cenario('linha ldapusersearch: decodificada volta exatamente ao filtro e ao DN', function () use ($PAC) {
-	$dn = "CN=NET_EXPEDICAO_INSTRUMENTAL,OU=Expedi\xc3\xa7\xc3\xa3o Instrumental,OU=AGF,DC=teste,DC=local";
-	$l = sqad_linha_ldapusersearch($PAC, $dn);
-	confere(strpos($l, 'ldapusersearch ldaps://localhost:636/DC=teste,DC=local?sAMAccountName?sub?') === 0, $l);
-	confere(strpos($l, ' ', strlen('ldapusersearch ')) === false, 'tem espaco dentro da URL: ' . $l);
-	confere(strpos($l, '%2c') !== false && strpos($l, '%c3%a7') !== false, 'virgula/acento nao codificados: ' . $l);
-	confere(strpos($l, '(sAMAccountName=%s)') !== false, 'o %s do SquidGuard foi codificado');
-	$filtro = rawurldecode(explode('?', $l)[3]);
-	confere($filtro === "(&(sAMAccountName=%s)(memberOf:1.2.840.113556.1.4.1941:={$dn}))", 'decodificado: ' . $filtro);
+cenario('origem = lista de usuarios: minuscula, ordenada, sem repetir; nome invalido fica de fora', function () {
+	$fora = [];
+	$o = sqad_origem_usuarios(['Martha.Barbosa', 'ana.teles', 'ana.teles', 'joao$', 'pedro silva', ''], $fora);
+	confere($o === "'ana.teles' 'martha.barbosa'", $o);
+	confere($fora === ['joao$', 'pedro silva'], json_encode($fora));
+	confere(sqad_origem_usuarios([]) === '', 'vazio');
+	confere(sqad_usuarios_da_origem($o) === ['ana.teles', 'martha.barbosa'], 'volta');
+	// cada item passa na validacao do proprio pfSense (is_username do SquidGuard 2.7.0)
+	foreach (explode(' ', $o) as $u) { confere(preg_match("/^\'[a-zA-Z_0-9\.\-]{1,}\'$/i", $u) === 1, "pfSense recusaria: $u"); }
 });
-$G = function ($nome, $guid, $ou = 'Setores') { return ['Nome' => $nome, 'Dn' => "CN={$nome},OU={$ou},OU=AGF,DC=teste,DC=local", 'Guid' => $guid]; };
+$G = function ($nome, $guid, $membros = ['ana'], $ou = 'Setores') { return ['Nome' => $nome, 'Dn' => "CN={$nome},OU={$ou},OU=AGF,DC=teste,DC=local", 'Guid' => $guid, 'Membros' => $membros]; };
 cenario('sincronizar regras: cria, nao duplica, preserva a regra manual', function () use ($PAC, $G, $ACL_MANUAL) {
 	$g = [$G('NET_FINANCEIRO', str_repeat('a', 32)), $G('NET_COMERCIAL', str_repeat('b', 32))];
-	[$a1, $m1] = sqad_sincronizar_acls([$ACL_MANUAL], $g, $PAC, 'NET_');
+	[$a1, $m1] = sqad_sincronizar_acls([$ACL_MANUAL], $g, 'NET_');
 	confere(count($a1) === 3 && count($m1) === 2, 'criou: ' . json_encode($m1));
 	confere($a1[0] === $ACL_MANUAL, 'mexeu na setor-davs');
 	confere($a1[1]['dest'] === 'all [ all]' && $a1[1]['disabled'] === '', 'regra nova libera tudo');
-	[$a2, $m2] = sqad_sincronizar_acls($a1, $g, $PAC, 'NET_');
+	[$a2, $m2] = sqad_sincronizar_acls($a1, $g, 'NET_');
 	confere($a2 === $a1 && $m2 === [], 'segunda vez mudou: ' . json_encode($m2));
 });
-cenario('grupo movido: so a origem muda, as restricoes do admin ficam', function () use ($PAC, $G) {
-	$g = [$G('NET_FINANCEIRO', str_repeat('a', 32))];
-	[$a] = sqad_sincronizar_acls([], $g, $PAC, 'NET_');
+cenario('membros mudaram: so a origem muda, as restricoes do admin ficam', function () use ($G) {
+	[$a] = sqad_sincronizar_acls([], [$G('NET_FINANCEIRO', str_repeat('a', 32), ['ana', 'bia'])], 'NET_');
+	confere($a[0]['source'] === "'ana' 'bia'", $a[0]['source']);
 	$a[0]['dest'] = '!jogos !redes_sociais all [ all]';   // admin restringiu na tela
 	$a[0]['time'] = 'expediente';
-	[$b, $m] = sqad_sincronizar_acls($a, [$G('NET_FINANCEIRO', str_repeat('a', 32), 'Financeiro')], $PAC, 'NET_');
-	confere(count($m) === 1 && strpos($m[0], 'origem atualizada') !== false, json_encode($m));
+	[$b, $m] = sqad_sincronizar_acls($a, [$G('NET_FINANCEIRO', str_repeat('a', 32), ['ana', 'caio'])], 'NET_');
+	confere(count($m) === 1 && strpos($m[0], 'entrou: caio') !== false && strpos($m[0], 'saiu: bia') !== false, json_encode($m));
 	confere($b[0]['dest'] === '!jogos !redes_sociais all [ all]' && $b[0]['time'] === 'expediente', 'perdeu a restricao');
-	confere(strpos($b[0]['source'], 'OU%3dFinanceiro') !== false || strpos($b[0]['source'], 'OU=Financeiro') !== false, 'origem nova');
+	confere($b[0]['source'] === "'ana' 'caio'", $b[0]['source']);
 });
-cenario('grupo apagado: desativa; recriado com o mesmo nome: reativa a mesma regra', function () use ($PAC, $G) {
-	[$a] = sqad_sincronizar_acls([], [$G('NET_COMERCIAL', str_repeat('b', 32))], $PAC, 'NET_');
+cenario('regra antiga com ldapusersearch vira lista de usuarios', function () use ($G) {
+	$velha = sqad_acl_nova('COMERCIAL', 'ldapusersearch ldaps://x:636/DC=a?sAMAccountName?sub?(x)', sqad_marca_acl(str_repeat('b', 32), 'NET_COMERCIAL'));
+	[$b, $m] = sqad_sincronizar_acls([$velha], [$G('NET_COMERCIAL', str_repeat('b', 32), ['martha.barbosa'])], 'NET_');
+	confere($b[0]['source'] === "'martha.barbosa'" && strpos($m[0], 'origem trocada') !== false, json_encode([$b[0]['source'], $m]));
+});
+cenario('grupo vazio: regra desativada (bloco vazio quebraria o squidGuard); com membros: reativa', function () use ($G) {
+	[$a, $m] = sqad_sincronizar_acls([], [$G('NET_COMPUTADORES', str_repeat('e', 32), [])], 'NET_');
+	confere($a[0]['disabled'] === 'on' && strpos($a[0]['description'], SQAD_VAZIO) !== false && $a[0]['source'] === '', json_encode($a[0]));
+	[$a2, $m2] = sqad_sincronizar_acls($a, [$G('NET_COMPUTADORES', str_repeat('e', 32), [])], 'NET_');
+	confere($m2 === [], 'mudou sem motivo: ' . json_encode($m2));
+	[$b, $m3] = sqad_sincronizar_acls($a, [$G('NET_COMPUTADORES', str_repeat('e', 32), ['tecnico'])], 'NET_');
+	confere($b[0]['disabled'] === '' && strpos($b[0]['description'], SQAD_VAZIO) === false, 'reativou: ' . json_encode($b[0]));
+	confere((bool)array_filter($m3, function ($x) { return strpos($x, 'REATIVADA') !== false; }), json_encode($m3));
+});
+cenario('regra desativada pelo ADMIN continua desativada (mesmo com membros)', function () use ($G) {
+	[$a] = sqad_sincronizar_acls([], [$G('NET_DIRETORIA', str_repeat('f', 32), ['dir'])], 'NET_');
+	$a[0]['disabled'] = 'on';   // admin desativou na tela
+	[$b, $m] = sqad_sincronizar_acls($a, [$G('NET_DIRETORIA', str_repeat('f', 32), ['dir', 'dir2'])], 'NET_');
+	confere($b[0]['disabled'] === 'on', 'reativou o que o admin desativou');
+	confere($b[0]['source'] === "'dir' 'dir2'", 'mas a lista atualiza');
+});
+cenario('grupo apagado: desativa; recriado com o mesmo nome: reativa a mesma regra', function () use ($G) {
+	[$a] = sqad_sincronizar_acls([], [$G('NET_COMERCIAL', str_repeat('b', 32))], 'NET_');
 	$a[0]['dest'] = '!jogos all [ all]';
-	[$b, $m] = sqad_sincronizar_acls($a, [], $PAC, 'NET_');
+	[$b, $m] = sqad_sincronizar_acls($a, [], 'NET_');
 	confere($b[0]['disabled'] === 'on' && strpos($b[0]['description'], SQAD_APAGADO) !== false, 'desativou: ' . json_encode($b[0]));
-	[$b2, $m2] = sqad_sincronizar_acls($b, [], $PAC, 'NET_');
+	[$b2, $m2] = sqad_sincronizar_acls($b, [], 'NET_');
 	confere($m2 === [], 'desativou de novo: ' . json_encode($m2));
-	[$c, $m3] = sqad_sincronizar_acls($b, [$G('NET_COMERCIAL', str_repeat('c', 32))], $PAC, 'NET_');
+	[$c, $m3] = sqad_sincronizar_acls($b, [$G('NET_COMERCIAL', str_repeat('c', 32))], 'NET_');
 	confere(count($c) === 1 && $c[0]['disabled'] === '' && $c[0]['dest'] === '!jogos all [ all]', 'reativou: ' . json_encode($c));
 	confere(sqad_info_acl($c[0])['guid'] === str_repeat('c', 32), 'GUID novo gravado');
 });
-cenario('LDAP no SquidGuard: liga, mantem o resto', function () use ($PAC, $SG_GERAL_ANTES) {
-	$n = sqad_sg_geral($SG_GERAL_ANTES, $PAC, 'x');
-	confere($n['ldap_enable'] === 'on' && $n['ldapbinddn'] === $PAC['Conta']['Dn'] && $n['ldapcachetime'] === '300', json_encode($n));
-	confere($n['squidguard_enable'] === 'on', 'mexeu no resto');
+cenario('squidGuard: o LDAP que versoes antigas ligaram e desligado; o do admin fica', function () use ($PAC, $SG_GERAL_ANTES) {
+	$nosso = array_merge($SG_GERAL_ANTES, ['ldap_enable' => 'on', 'ldapbinddn' => $PAC['Conta']['Dn'], 'ldapbindpass' => 'Aa1!x@y']);
+	$n = sqad_sg_geral($nosso, $PAC);
+	confere($n['ldap_enable'] === '' && $n['ldapbindpass'] === '' && $n['squidguard_enable'] === 'on', json_encode($n));
+	$doadmin = array_merge($SG_GERAL_ANTES, ['ldap_enable' => 'on', 'ldapbinddn' => 'CN=outra', 'ldapbindpass' => 'x']);
+	confere(sqad_sg_geral($doadmin, $PAC) === $doadmin, 'mexeu no LDAP do admin');
 });
-
+cenario('confere a configuracao com o squidGuard: detecta erro de sintaxe', function () {
+	confere(sqad_sg_conf_erro() === null, 'acusou erro numa configuracao boa');
+	$ok = file_get_contents(SQAD_SG_CONF);
+	file_put_contents(SQAD_SG_CONF, "ldapbindpass Aa1 QUEBRADO\\n");
+	$e = sqad_sg_conf_erro();
+	file_put_contents(SQAD_SG_CONF, $ok);
+	confere($e !== null && stripos($e, 'syntax error') !== false, 'nao detectou: ' . var_export($e, true));
+});
 fwrite(STDERR, "3) Log do Squid e relatorio\n");
 $LOG = [
 	'1793100000.100   45 172.16.30.10 TCP_TUNNEL/200 3920 CONNECT www.bb.com.br:443 joao.silva HIER_DIRECT/1.2.3.4 -',
@@ -237,9 +273,11 @@ cenario('aplicar --sim: backup, CA, teste do helper, config e Squid reiniciado',
 	confere(is_readable(SQAD_ESTADO), 'estado');
 	// v1.1: SquidGuard
 	$sg = config_get_path('installedpackages/squidguardgeneral/config/0');
-	confere($sg['ldap_enable'] === 'on' && $sg['ldapbindpass'] === $PAC['Conta']['Senha'], 'LDAP do SquidGuard');
+	confere(($sg['ldapbindpass'] ?? '') === '', 'a senha NAO pode ir para o squidGuard.conf');
 	$acls = config_get_path('installedpackages/squidguardacl/config');
 	confere(count($acls) === 5 && $acls[0]['name'] === 'setor-davs', 'regras: ' . json_encode(array_column($acls, 'name')));
+	foreach (array_slice($acls, 1) as $a) { confere(strpos($a['source'], 'ldapusersearch') === false, 'ainda usa ldapusersearch'); }
+	confere(preg_match("/^'[a-z0-9_.-]+'( '[a-z0-9_.-]+')*$/", $acls[1]['source']) === 1, 'origem: ' . $acls[1]['source']);
 	confere($GLOBALS['sg_resyncs'] >= 1, 'Apply do SquidGuard');
 	confere(($GLOBALS['cron'][SQAD_CRON] ?? null) === '*/15', 'cron: ' . json_encode($GLOBALS['cron']));
 	confere(is_readable(SQAD_SCRIPT_FIXO), 'script copiado para /root');
@@ -274,14 +312,14 @@ cenario('sincronizar sem mudanca: nao grava nem faz Apply', function () {
 });
 cenario('grupo novo no AD vira regra; apagado e desativado', function () use ($G) {
 	$antes = $GLOBALS['sqad_fake_ad_grupos'];
-	$GLOBALS['sqad_fake_ad_grupos'] = array_merge(array_slice($antes, 1), [$G('NET_LICITACAO', str_repeat('d', 32))]);
+	$GLOBALS['sqad_fake_ad_grupos'] = array_merge(array_slice($antes, 1), [$G('NET_LICITACAO', str_repeat('d', 32), ['lici'])]);
 	$r = $GLOBALS['sg_resyncs'];
 	sqad_cmd_sincronizar(['cron' => true, 'sim' => true]);
 	$acls = config_get_path('installedpackages/squidguardacl/config');
 	$nomes = array_column($acls, 'name');
 	confere(in_array('LICITACAO', $nomes, true), 'nova: ' . json_encode($nomes));
-	$apagada = array_values(array_filter($acls, function ($a) { return ($a['disabled'] ?? '') === 'on'; }));
-	confere(count($apagada) === 1, 'desativada: ' . json_encode($apagada));
+	$apagada = array_values(array_filter($acls, function ($a) { return ($a['disabled'] ?? '') === 'on' && strpos($a['description'], SQAD_APAGADO) !== false; }));
+	confere(count($apagada) === 1 && $apagada[0]['name'] === 'COMERCIAL', 'desativada por grupo apagado: ' . json_encode(array_column($apagada, 'name')));
 	confere($GLOBALS['sg_resyncs'] === $r + 1, 'Apply');
 	$e = json_decode(file_get_contents(SQAD_ESTADO), true);
 	confere(in_array('NET_LICITACAO', array_column($e['Setores'], 'Nome'), true), 'relatorio sabe do setor novo');

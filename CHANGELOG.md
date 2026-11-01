@@ -1,5 +1,14 @@
 # Histórico de versões
 
+## [1.3.0] — 2026-11-01
+
+### Corrigido (provado no squidGuard real da AGF)
+- **O squidGuard 1.4 do pfSense 2.7 não faz LDAPS** e **quebrava com `!` e `@` na senha** (erro de sintaxe → modo de emergência, liberando tudo, inclusive regras manuais). As regras dos setores agora levam a **lista de usuários do grupo** na origem (`'fulano' 'ciclano'`), escrita pela sincronização (LDAPS, a cada 15 min). O squidGuard não consulta mais o AD, e o LDAP que a 1.1/1.2 ligou nas *General settings* é desligado (a senha sai do `squidGuard.conf`).
+- Grupo sem membros deixa a regra **desativada** (bloco vazio quebraria o squidGuard) e ela volta sozinha quando houver membros. Regra desativada pelo administrador continua desativada.
+- Depois de cada *Apply*, a configuração é **conferida com o squidGuard real**; erro de sintaxe vira aviso na tela e no log.
+- Senha gerada pelo script do AD só com letras, números e `- _ .`.
+- O arquivo do AD leva os membros de cada setor (usados se o pfSense não conseguir consultar o AD na hora).
+
 ## [1.2.0] — 2026-11-01
 
 ### Alterado

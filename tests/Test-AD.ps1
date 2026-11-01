@@ -70,7 +70,7 @@ Cenario '32 caracteres, 4 classes, sem caracteres perigosos, sempre diferente' {
         $s = New-SenhaForte
         if ($s.Length -ne 32) { throw "tamanho $($s.Length)" }
         if ($s -notmatch '[A-Z]' -or $s -notmatch '[a-z]' -or $s -notmatch '\d' -or $s -notmatch '[^A-Za-z0-9]') { throw "faltou classe: $s" }
-        if ($s -match "[`"'\\\s`$``]") { throw "caractere perigoso: $s" }
+        if ($s -notmatch '^[A-Za-z0-9._-]+$') { throw "caractere fora de letras/numeros/-_. : $s" }
         if ($vistas.ContainsKey($s)) { throw 'senha repetida' }
         $vistas[$s] = $true
     }
@@ -185,7 +185,7 @@ function Get-ADGroup { param($Filter, $Identity, $Properties, $ErrorAction)
 function New-ADGroup { param($Name, $SamAccountName, $GroupCategory, $GroupScope, $Path, $Description, [switch]$PassThru)
     $g = [pscustomobject]@{ Name = $Name; DistinguishedName = "CN=$Name,$Path"; ObjectGUID = [guid]::NewGuid(); Members = (New-Object System.Collections.ArrayList) }
     [void]$script:AD.Groups.Add($g); $g }
-function Get-ADGroupMember { param($Identity)
+function Get-ADGroupMember { param($Identity, [switch]$Recursive)
     @($Identity.Members | ForEach-Object { $dn = $_; [pscustomobject]@{ distinguishedName = $dn; objectClass = 'user' } }) }
 function Add-ADGroupMember { param($Identity, $Members) foreach ($m in $Members) { [void]$Identity.Members.Add($m.DistinguishedName) } }
 function Remove-ADGroupMember { param($Identity, $Members, $Confirm) foreach ($m in $Members) { $Identity.Members.Remove($m.DistinguishedName) } }
@@ -272,6 +272,9 @@ Cenario 'New-PacoteSquid gera o JSON que o PHP le' {
     if ($volta.Setores.Count -ne 4 -or $volta.Servidor.Porta -ne 636) { throw "estrutura errada ($($volta.Setores.Count) setores)" }
     if (@($volta.Setores | Where-Object { $_.Guid -notmatch '^[0-9a-f]{32}$' }).Count) { throw 'setor sem Guid' }
     if ($volta.Sync.Prefixo -ne 'NET_') { throw 'Sync' }
+    $fin = $volta.Setores | Where-Object Nome -eq 'NET_FINANCEIRO'
+    # diretor: excecao [proxy-manual] colocada no cenario anterior
+    if ((@($fin.Membros) -join ',') -ne 'ana,diretor') { throw "membros do NET_FINANCEIRO no arquivo: $(@($fin.Membros) -join ',')" }
     "($arq)"
 }
 

@@ -43,7 +43,7 @@ php /tmp/squid-ad.php aplicar /tmp/squid-ad-AGFMEDICAL.json --sim
 6. **CA do AD** em `/usr/local/etc/squid-ad/ca-ad.pem`, com um bloco marcado no `/usr/local/etc/openldap/ldap.conf`. É de lá que o helper LDAP do Squid lê a CA.
 7. **Testa o login** com o **mesmo helper do Squid** (`basic_ldap_auth`), com a conta de serviço e, por SSH, também com um usuário real. **Se o teste falhar, o Squid não é alterado.**
 8. **Aplica** os campos de autenticação, grava o `config.xml` e reinicia o Squid, igual ao botão *Save* da tela.
-9. **SquidGuard** (se instalado): liga o LDAP nas *General settings*, cria **uma regra por setor** no *Groups ACL* (liberando tudo) e faz o *Apply*. As regras que você já tinha ficam como estão.
+9. **SquidGuard** (se instalado): cria **uma regra por setor** no *Groups ACL*, com a lista de usuários do grupo e liberando tudo, faz o *Apply* e **confere a configuração com o squidGuard real**. As regras que você já tinha ficam como estão.
 10. **Cron:** instala a sincronização a cada 15 minutos (`php /root/squid-ad.php sincronizar --cron`) e copia o script para `/root`. Veja [Setores e sincronização](setores.md).
 
 Os campos que o script preenche (os mesmos da tela *Services › Squid Proxy Server › Authentication*):

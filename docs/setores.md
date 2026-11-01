@@ -20,6 +20,15 @@ OU=AGF                                          ──────────�
 - O grupo `NET_` é **só de internet**, separado dos grupos de pastas (ex.: `GR_`/`GRE_`). Ele fica **dentro da OU** do departamento.
 - O grupo **espelha a OU**: quem está na OU está no grupo.
 - Cada grupo vira uma regra no SquidGuard que **libera tudo**. Para restringir um setor, edite a regra na tela e escolha as *Target categories* (por exemplo, `!jogos`). **A sincronização nunca mexe nisso**: ela só cuida de *quem* é o setor.
+- A origem (*Client source*) de cada regra é a **lista de usuários do grupo**, no mesmo formato da tela: `'ana.teles' 'martha.barbosa'`. Abrindo a regra, você vê quem está no setor.
+
+### Por que uma lista de usuários (e não `ldapusersearch`)
+
+O squidGuard 1.4 do pfSense 2.7 **não faz LDAPS**: ele só consultaria o AD por LDAP sem criptografia, e ainda quebra a configuração se a senha da conta tiver certos caracteres (como `!` e `@`). Então quem consulta o AD é a sincronização do pfSense, por **LDAPS**, a cada 15 minutos. Ela escreve a lista na regra, e o squidGuard nem precisa falar com o AD. Quem muda de setor passa a valer em **até 15 minutos**.
+
+- O squidGuard não diferencia maiúsculas: `Martha.Barbosa` e `martha.barbosa` são a mesma pessoa.
+- Nomes de usuário com caracteres que o pfSense não aceita na origem (fora de letras, números, `_`, `.` e `-`) ficam fora da regra, com aviso no log.
+- **Setor sem ninguém** (ex.: `NET_COMPUTADORES`) fica com a regra **desativada**, porque um bloco vazio quebraria o squidGuard. Ela é reativada sozinha quando o grupo ganha membros. Regra que **você** desativou na tela continua desativada.
 
 ## Sincronização automática (a cada 15 minutos)
 
@@ -28,7 +37,7 @@ Duas tarefas mantêm tudo em dia, sem ninguém rodar nada:
 | Onde | O que faz |
 |---|---|
 | **AD** (tarefa agendada `pfSense-Squid-AD - Sincronizar setores`, como SYSTEM) | OU de departamento **nova** ganha o grupo `NET_`. Usuário **novo** entra no grupo do departamento. Usuário que **mudou de OU** sai do grupo antigo e entra no novo |
-| **pfSense** (cron `squid-ad.php sincronizar`) | Grupo `NET_` **novo** vira regra. Grupo **renomeado ou movido** tem a origem da regra atualizada. Grupo **apagado** tem a regra **desativada**, e as restrições ficam guardadas nela. Grupo **recriado** com o mesmo nome **reativa** a mesma regra |
+| **pfSense** (cron `squid-ad.php sincronizar`) | Grupo `NET_` **novo** vira regra. **Membros que mudaram** atualizam a lista da regra. Grupo **apagado** ou **vazio** tem a regra **desativada**, e as restrições ficam guardadas nela. Grupo **recriado** com o mesmo nome **reativa** a mesma regra. Depois de cada *Apply*, a configuração é **conferida com o squidGuard real** |
 
 Nos dois lados, só aplica quando **algo mudou**.
 

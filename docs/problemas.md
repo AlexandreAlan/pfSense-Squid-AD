@@ -32,6 +32,8 @@
 | Evento **2001** no AD | A tarefa agendada falhou | Ver `C:\ProgramData\pfSense-Squid-AD\sincronizacao.log` |
 | Pessoa saiu do grupo sem querer | O espelhamento tirou quem não está na OU | Mover a pessoa para a OU certa, ou usar `[proxy-manual]` na descrição dela |
 | Regra do setor não aparece no SquidGuard | Sincronização ainda não rodou | Esperar 15 min ou rodar `sincronizar` |
+| `o squidGuard RECUSOU a configuracao` | Erro de sintaxe no `squidGuard.conf`: o squidGuard entra em **modo de emergência e libera tudo** | Ver a linha indicada em *Services › SquidGuard*; avisar o projeto se veio de uma regra gerada |
+| Regra de setor desativada com "(grupo sem membros)" | O grupo do AD está vazio | Normal: volta sozinha quando o grupo tiver alguém |
 
 ## No dia a dia
 
