@@ -234,7 +234,28 @@ Cenario 'OU nova de departamento ganha o grupo sozinha' {
     if (-not $q -or $q.Members.Count -ne 1) { throw 'grupo da OU nova' }
     "($($r.Log -join ' | '))"
 }
+Cenario 'OU recusada (N) fica lembrada e a tarefa automatica nao cria o grupo' {
+    Novo-OU "OU=Computadores,$base"
+    $script:Yes = $false
+    # interativo: S para as outras perguntas que aparecerem, N para Computadores
+    $script:fila.Clear(); 1..10 | ForEach-Object { $script:fila.Enqueue('n') }
+    $r = Sync-SetoresAD $base 'NET_' $true
+    if (@($r.Ignoradas) -notcontains "OU=Computadores,$base") { throw "nao lembrou: $($r.Ignoradas -join ';')" }
+    if ($script:AD.Groups | Where-Object Name -eq 'NET_COMPUTADORES') { throw 'criou mesmo com N' }
+    $r2 = Sync-SetoresAD $base 'NET_' $false @($r.Ignoradas)
+    if ($script:AD.Groups | Where-Object Name -eq 'NET_COMPUTADORES') { throw 'a tarefa automatica criou a OU recusada' }
+    'ok'
+}
 $script:SetoresTeste = @($script:AD.Groups)
+
+[Console]::WriteLine('7b) Excecoes da GPO')
+Cenario 'padrao sempre entra; extras somam sem repetir' {
+    $p = '<local>;*.agfmedical.local;10.*;172.16.*;192.168.*'
+    if ((Join-Excecoes $p '172.16.10.7') -ne "$p;172.16.10.7") { throw (Join-Excecoes $p '172.16.10.7') }
+    if ((Join-Excecoes $p '') -ne $p) { throw 'sem extras' }
+    if ((Join-Excecoes $p ' 172.16.* ; intranet.local;') -ne "$p;intranet.local") { throw (Join-Excecoes $p ' 172.16.* ; intranet.local;') }
+    'ok'
+}
 
 [Console]::WriteLine('8) Arquivo para o pfSense (contrato com o squid-ad.php)')
 Cenario 'New-PacoteSquid gera o JSON que o PHP le' {

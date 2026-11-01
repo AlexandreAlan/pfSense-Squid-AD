@@ -1,5 +1,11 @@
 # Histórico de versões
 
+## [1.1.1] — 2026-11-01
+
+### Corrigido (vistos na AGF)
+- OU recusada na instalação (ex.: `Computadores`) fica gravada em `Ignorar` e a tarefa agendada não cria o grupo dela depois.
+- Exceções da GPO: o padrão (`<local>`, domínio, redes privadas) sempre entra; a pergunta agora pede só as exceções **extras**. Antes, digitar um IP substituía o padrão.
+
 ## [1.1.0] — 2026-11-01
 
 ### Adicionado

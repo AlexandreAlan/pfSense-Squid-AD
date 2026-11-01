@@ -20,7 +20,7 @@
  * mexe nisso, so na origem (quem e o setor).
  */
 
-const SQAD_VERSAO    = '1.1.0';
+const SQAD_VERSAO    = '1.1.1';
 const SQAD_MARCA_INI = '# >>> pfSense-Squid-AD (gerado automaticamente - nao edite este bloco) >>>';
 const SQAD_MARCA_FIM = '# <<< pfSense-Squid-AD <<<';
 const SQAD_PROMPT    = 'Proxy da empresa: use seu usuario e senha do Windows';

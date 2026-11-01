@@ -54,7 +54,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$VersaoProjeto = '1.1.0'
+$VersaoProjeto = '1.1.1'
 $Aqui = Split-Path -Parent $MyInvocation.MyCommand.Definition
 # Padroes que costumam indicar grupo de SETOR (ex.: SETOR-FINANCEIRO, DEP_COMPRAS)
 $PadraoSetor = '^(SETOR|SET|DEP|DEPTO|DEPARTAMENTO|GRP|GG|GS)[-_ .]'
@@ -251,6 +251,16 @@ function ConvertTo-NomeSetor([string]$Nome) {
     return (($sem.ToUpperInvariant() -replace '[^A-Z0-9]+', '_').Trim('_'))
 }
 
+# Junta as excecoes do proxy (padrao + extras), sem repetir e sem itens vazios.
+function Join-Excecoes([string]$Padrao, [string]$Extras) {
+    $itens = New-Object System.Collections.Generic.List[string]
+    foreach ($x in (("$Padrao;$Extras") -split ';')) {
+        $x = $x.Trim()
+        if ($x -and -not ($itens | Where-Object { $_ -ieq $x })) { $itens.Add($x) }
+    }
+    return ($itens -join ';')
+}
+
 # GUID no MESMO formato que o pfSense le pelo LDAP (bytes crus do objectGUID em
 # hexa). Guid.ToString() usa outra ordem de bytes e quebraria a sincronizacao.
 function ConvertTo-GuidHex([guid]$Guid) {
@@ -272,16 +282,25 @@ function Get-MudancasMembros($Desejados, $Atuais) {
 # <Prefixo><NOME DA OU> (dentro da propria OU) e espelha os membros.
 # $Interativo: pergunta antes de criar/alterar. Sem isso (tarefa agendada),
 # aplica direto e devolve o que fez em .Log.
-function Sync-SetoresAD([string]$BaseOu, [string]$Prefixo, [bool]$Interativo) {
+# $Ignorar: DNs de OUs que o administrador recusou (ex.: Computadores). Ficam
+# gravadas na configuracao e a tarefa agendada nunca cria grupo para elas.
+function Sync-SetoresAD([string]$BaseOu, [string]$Prefixo, [bool]$Interativo, [string[]]$Ignorar = @()) {
     $log = New-Object System.Collections.Generic.List[string]
     $grupos = New-Object System.Collections.Generic.List[object]
+    $ignoradas = New-Object System.Collections.Generic.List[string]
+    foreach ($x in @($Ignorar)) { if ($x) { $ignoradas.Add($x) } }
     $ous = @(Get-ADOrganizationalUnit -SearchBase $BaseOu -SearchScope OneLevel -Filter * | Sort-Object Name)
     foreach ($ou in $ous) {
+        if ($ignoradas -contains [string]$ou.DistinguishedName) { continue }
         $nome = $Prefixo + (ConvertTo-NomeSetor $ou.Name)
         $usuarios = @(Get-ADUser -SearchBase $ou.DistinguishedName -SearchScope Subtree -Filter 'Enabled -eq $true' -Properties Description)
         $g = Get-ADGroup -Filter "Name -eq '$nome'" -ErrorAction SilentlyContinue
         if (-not $g) {
-            if ($Interativo -and -not (Read-SimNao ("Criar o grupo '{0}' na OU '{1}' ({2} usuario(s) nela)?" -f $nome, $ou.Name, $usuarios.Count) $true)) { continue }
+            if ($Interativo -and -not (Read-SimNao ("Criar o grupo '{0}' na OU '{1}' ({2} usuario(s) nela)?" -f $nome, $ou.Name, $usuarios.Count) $true)) {
+                $ignoradas.Add([string]$ou.DistinguishedName)   # lembrada: a sincronizacao nao cria depois
+                Info "    OU '$($ou.Name)' fica fora dos setores (a sincronizacao automatica respeita isso)"
+                continue
+            }
             $g = New-ADGroup -Name $nome -SamAccountName $nome -GroupCategory Security -GroupScope Global -Path $ou.DistinguishedName `
                 -Description ("Internet (proxy) - setor {0} - pfSense-Squid-AD" -f $ou.Name) -PassThru
             $log.Add("grupo criado: $nome (OU $($ou.Name))")
@@ -304,7 +323,7 @@ function Sync-SetoresAD([string]$BaseOu, [string]$Prefixo, [bool]$Interativo) {
         $grupos.Add((Get-ADGroup -Identity $g -Properties ObjectGUID))
     }
     # .ToArray(): @() de List<T> dentro de [pscustomobject]@{} dispara 'Argument types do not match'
-    return [pscustomobject]@{ Grupos = $grupos.ToArray(); Log = $log.ToArray() }
+    return [pscustomobject]@{ Grupos = $grupos.ToArray(); Log = $log.ToArray(); Ignoradas = $ignoradas.ToArray() }
 }
 
 if ($Sincronizar) {
@@ -321,7 +340,7 @@ if ($Sincronizar) {
         if (-not [Diagnostics.EventLog]::SourceExists($fonte)) { New-EventLog -LogName Application -Source $fonte }
         Import-Module ActiveDirectory -ErrorAction Stop
         $c = Get-Content $cfgSync -Raw | ConvertFrom-Json
-        $r = Sync-SetoresAD $c.BaseOu $c.Prefixo $false
+        $r = Sync-SetoresAD $c.BaseOu $c.Prefixo $false @($c.Ignorar)
         if ($r.Log.Count) {
             foreach ($l in $r.Log) { Write-LogSync $l }
             Write-EventLog -LogName Application -Source $fonte -EventId 2000 -EntryType Information -Message ("Setores sincronizados:`n" + ($r.Log -join "`n"))
@@ -462,9 +481,14 @@ if ($topo.Count) {
         $prefixo = Read-Valor 'Prefixo dos grupos de internet' 'NET_' { param($v) $v -match '^[A-Za-z][A-Za-z0-9_-]{0,9}$' } 'use ate 10 caracteres: letras, numeros, _ ou -, comecando com letra.'
         Info 'Para cada departamento: o grupo fica DENTRO da OU dele e recebe os usuarios ativos'
         Info 'que estao nela (espelhado). Usuario com [proxy-manual] na Descricao nunca e tirado.'
-        $r = Sync-SetoresAD $empresa.DistinguishedName $prefixo $true
+        # Rodando de novo: respeita as OUs recusadas antes (configuracao da tarefa)
+        $ignorarAntes = @()
+        $cfgAntiga = Join-Path (Join-Path $env:ProgramData 'pfSense-Squid-AD') 'sincronizacao.json'
+        if (Test-Path $cfgAntiga) { try { $ignorarAntes = @((Get-Content $cfgAntiga -Raw | ConvertFrom-Json).Ignorar) } catch {} }
+        $r = Sync-SetoresAD $empresa.DistinguishedName $prefixo $true $ignorarAntes
         foreach ($g in $r.Grupos) { $setores.Add($g) }
-        $sync = [ordered]@{ BaseOu = [string]$empresa.DistinguishedName; Prefixo = $prefixo }
+        $sync = [ordered]@{ BaseOu = [string]$empresa.DistinguishedName; Prefixo = $prefixo; Ignorar = @($r.Ignoradas) }
+        if ($r.Ignoradas.Count) { Info ('OUs fora dos setores: ' + (($r.Ignoradas | ForEach-Object { ($_ -split ',')[0] -replace '^OU=' }) -join ', ')) }
         $soltos = @(Get-ADUser -SearchBase $empresa.DistinguishedName -SearchScope OneLevel -Filter 'Enabled -eq $true')
         if ($soltos.Count) {
             Warn ("{0} usuario(s) direto em '{1}', fora dos departamentos: ficam SEM SETOR (acessam" -f $soltos.Count, $empresa.Name)
@@ -582,7 +606,13 @@ if (Read-SimNao 'Criar a GPO que configura o proxy nos PCs?' $false) {
     $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1).NextHop
     $ipProxy = Read-Valor 'IP do pfSense na LAN (endereco do proxy)' "$gw" { param($v) $v -match '^((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)$' } 'digite um IPv4 valido (ex.: 172.16.10.1).'
     $portaProxy = Read-Valor 'Porta do proxy do Squid' '3128' { param($v) $v -match '^\d+$' -and [int]$v -ge 1 -and [int]$v -le 65535 } 'porta de 1 a 65535.'
-    $excecoes = Read-Valor 'Excecoes (nao passam pelo proxy)' "<local>;*.$($dom.DNSRoot);10.*;172.16.*;192.168.*"
+    # O padrao SEMPRE entra (rede local e dominio nao passam pelo proxy); aqui so
+    # se acrescenta o que for extra. Antes, digitar algo substituia o padrao.
+    $padraoExc = "<local>;*.$($dom.DNSRoot);10.*;172.16.*;192.168.*"
+    Info "excecoes padrao (nao passam pelo proxy): $padraoExc"
+    $extras = ''
+    if (-not $Yes) { $extras = ("" + (Read-Host '    Excecoes EXTRAS, separadas por ; (ENTER = nenhuma)')).Trim().Trim(';') }
+    $excecoes = Join-Excecoes $padraoExc $extras
     $gpoNome = Read-Valor 'Nome da GPO' 'Proxy Squid - pfSense'
     $gpo = Get-GPO -Name $gpoNome -ErrorAction SilentlyContinue
     if ($gpo) { Ok "a GPO '$gpoNome' ja existe - atualizando os valores" }
