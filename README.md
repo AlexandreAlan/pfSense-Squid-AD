@@ -82,6 +82,7 @@ php /tmp/squid-ad.php relatorio --dias 7
 | [Relatório](docs/relatorio.md) | Monitorar acessos por usuário e setor, exportar CSV |
 | [Problemas comuns](docs/problemas.md) | Cada mensagem de erro e o que fazer |
 | [Desenvolvimento](docs/desenvolvimento.md) | Estrutura, testes e próximos passos |
+| [Roteiro](docs/roadmap.md) | Próxima fase: inspeção SSL bem feita (CA por GPO, bancos e certificado digital sem inspeção) |
 
 ## Histórico
 
