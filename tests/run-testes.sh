@@ -18,7 +18,8 @@ echo "== Certificados de teste (CA + controlador dc.teste.local)"
 cd "$WORK"
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=CA Teste pfSense-Squid-AD" -keyout ca.key -out ca.pem 2>/dev/null
 openssl req -newkey rsa:2048 -nodes -subj "/CN=dc.teste.local" -keyout dc.key -out dc.csr 2>/dev/null
-printf 'subjectAltName=DNS:dc.teste.local,DNS:*.dcs.teste.local\nextendedKeyUsage=serverAuth\n' > ext.cnf
+# Como um DC de verdade: alem dos nomes, o SAN traz o GUID do objeto no AD (OID 1.3.6.1.4.1.311.25.1)
+printf 'subjectAltName=@alt\nextendedKeyUsage=serverAuth\n[alt]\notherName.1=1.3.6.1.4.1.311.25.1;FORMAT:HEX,OCT:fbb70dbc38a9d64f9304abaf26b74181\nDNS.1=dc.teste.local\nDNS.2=*.dcs.teste.local\n' > ext.cnf
 openssl x509 -req -in dc.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -extfile ext.cnf -out dc.pem 2>/dev/null
 PIN="$(openssl x509 -in ca.pem -outform der | sha256sum | cut -d' ' -f1)"
 openssl s_server -quiet -accept "$PORTA" -cert dc.pem -key dc.key -cert_chain ca.pem -www >/dev/null 2>&1 &

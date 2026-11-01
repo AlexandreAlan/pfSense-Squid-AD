@@ -75,6 +75,8 @@ function Read-Valor([string]$Pergunta, [string]$Padrao, [scriptblock]$Valido = {
         $r = Read-Host "    $Pergunta [$Padrao]"
         if ([string]::IsNullOrWhiteSpace($r)) { $r = $Padrao }
         $r = "$r".Trim()
+        # "S" / "sim" numa pergunta de valor = "aceito o padrao" (todo mundo faz isso)
+        if ($Padrao -and $r -match '^(s|sim|y|yes)$' -and -not (& $Valido $r)) { $r = $Padrao }
         if ($r -and (& $Valido $r)) { return $r }
         Warn $Ajuda
     }
@@ -136,7 +138,12 @@ function Get-LdapsInfo([string]$Servidor, [int]$Porta = 636, [string]$Endereco =
 
     $nomes = @()
     $san = $cert.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' } | Select-Object -First 1
-    if ($san) { $nomes = @(($san.Format($false) -split ',\s*') | ForEach-Object { ($_ -split '[=:]', 2)[-1].Trim() }) }
+    if ($san) {
+        # So nomes DNS e IPs. O SAN de DC tambem traz o GUID do objeto
+        # ("Guia de Objeto DS=04 10 ...") - isso nao e nome e fica de fora.
+        $nomes = @(($san.Format($false) -split ',\s*') | ForEach-Object { ($_ -split '[=:]', 2)[-1].Trim() } |
+            Where-Object { $_ -match '^(\*\.)?[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$' })
+    }
     $cn = ($cert.Subject -split ',\s*' | Where-Object { $_ -like 'CN=*' } | Select-Object -First 1)
     if ($cn) { $nomes += $cn.Substring(3) }
     # Nome exato, ou curinga (*.dominio.local) cobrindo o nome do servidor
@@ -438,7 +445,12 @@ if (-not $Yes -and (Read-SimNao 'Testar o login com um usuario real do AD?' $tru
                 $q = '(&(sAMAccountName=' + (ConvertTo-LdapFiltro $u) + ')(memberOf:1.2.840.113556.1.4.1941:=' + (ConvertTo-LdapFiltro $_.DistinguishedName) + '))'
                 (Search-Ldap $con $dom.DistinguishedName $q @('sAMAccountName')).Count -gt 0 } | ForEach-Object { $_.Name })
             Ok "login de '$u' OK - setor(es): $(if ($dele) { $dele -join ', ' } else { 'SEM SETOR (acessa tudo)' })"
-        } catch { Warn "senha recusada para '$u': $($_.Exception.Message)" }
+        } catch {
+            Warn "o AD encontrou '$u', mas RECUSOU a senha. Causas mais comuns:"
+            Info '    senha digitada errada; "o usuario deve alterar a senha no proximo logon" marcado;'
+            Info '    conta bloqueada por tentativas; senha expirada. (Detalhe: ' + $_.Exception.InnerException.Message + ')'
+            Info '    Depois de corrigir, teste no pfSense: php squid-ad.php testar <usuario>'
+        }
     }
     $senhaU = $null
 }

@@ -30,6 +30,8 @@ function Cenario([string]$Nome, [scriptblock]$Corpo) {
 Cenario 'le o certificado, a CA e confere o nome' {
     $i = Get-LdapsInfo 'dc.teste.local' $PortaTls '127.0.0.1'
     if (-not $i.NomeConfere) { throw "nome nao conferiu (nomes: $($i.Nomes))" }
+    # o certificado de teste traz o GUID de objeto do AD no SAN, como um DC real
+    if ($i.Nomes -ne 'dc.teste.local, *.dcs.teste.local') { throw "a lista de nomes deveria ter so os nomes DNS: $($i.Nomes)" }
     $sha = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($i.Raiz.RawData)) -replace '-', ''
     if ($sha -ne $PinCaOpenssl.ToUpper()) { throw "CA extraida errada: $sha" }
     "(nomes: $($i.Nomes))"
@@ -99,6 +101,13 @@ Cenario 'Read-Valor valida e repete' {
     Responder @('abc', '0', '3128')
     $v = Read-Valor 'porta' '3128' { param($v) $v -match '^\d+$' -and [int]$v -ge 1 }
     if ($v -ne '3128') { throw "valor: $v" }
+    'ok'
+}
+Cenario 'S numa pergunta de valor aceita o padrao (e nao vira valor)' {
+    $ip = { param($v) $v -match '^\d+\.\d+\.\d+\.\d+$' }
+    Responder @('s'); if ((Read-Valor 'ip' '172.16.10.7' $ip) -ne '172.16.10.7') { throw 's' }
+    Responder @('Sim'); if ((Read-Valor 'ip' '172.16.10.7' $ip) -ne '172.16.10.7') { throw 'Sim' }
+    Responder @('s'); if ((Read-Valor 'nome' 'svc' { $true }) -ne 's') { throw 'onde s e valido, vale o s' }
     'ok'
 }
 $Yes = $true
