@@ -9,18 +9,24 @@
  *   php squid-ad.php aplicar   <arquivo.json> [--sim] aplica (pergunta S/N; --sim = S para tudo)
  *   php squid-ad.php testar    <usuario>              testa o login de um usuario no AD
  *   php squid-ad.php relatorio [--dias N] [--usuario X] [--csv arquivo]
+ *   php squid-ad.php sincronizar [--forcar]          traz do AD os grupos de setor (NET_*) para o SquidGuard
  *   php squid-ad.php status
- *   php squid-ad.php desfazer  [--sim]                volta a autenticacao como estava antes
+ *   php squid-ad.php desfazer  [--sim]                volta tudo como estava antes do projeto
  *
  * O <arquivo.json> e gerado pelo Install-SquidAD.ps1 no servidor AD.
- * Nesta versao todo usuario autenticado acessa tudo; os setores alimentam o
- * relatorio (e a restricao futura).
+ * Nesta versao todo usuario autenticado acessa tudo. Cada setor (grupo NET_ do
+ * AD) vira uma regra no SquidGuard (Groups ACL) que LIBERA TUDO; para restringir,
+ * edite a regra na tela e escolha as Target categories - a sincronizacao nunca
+ * mexe nisso, so na origem (quem e o setor).
  */
 
-const SQAD_VERSAO    = '1.0.0';
+const SQAD_VERSAO    = '1.1.0';
 const SQAD_MARCA_INI = '# >>> pfSense-Squid-AD (gerado automaticamente - nao edite este bloco) >>>';
 const SQAD_MARCA_FIM = '# <<< pfSense-Squid-AD <<<';
 const SQAD_PROMPT    = 'Proxy da empresa: use seu usuario e senha do Windows';
+const SQAD_MARCA_ACL = 'pfSense-Squid-AD';            // descricao das regras criadas no SquidGuard
+const SQAD_APAGADO   = '(grupo apagado no AD)';
+const SQAD_CRON      = '/usr/local/bin/php /root/squid-ad.php sincronizar --cron';
 /* Caminhos do pfSense. Os testes (tests/) definem antes, apontando para pastas temporarias. */
 foreach ([
 	'SQAD_DIR'         => '/usr/local/etc/squid-ad',
@@ -32,11 +38,14 @@ foreach ([
 	'SQAD_ACCESSLOG'   => '/var/squid/logs/access.log',
 	'SQAD_CONFIGXML'   => '/cf/conf/config.xml',
 	'SQAD_VERSIONFILE' => '/etc/version',
+	'SQAD_SQUIDGUARDINC' => '/usr/local/pkg/squidguard.inc',
+	'SQAD_SCRIPT_FIXO' => '/root/squid-ad.php',
 ] as $c => $v) {
 	if (!defined($c)) { define($c, $v); }
 }
 define('SQAD_ESTADO', SQAD_DIR . '/estado.json');
 define('SQAD_CA', SQAD_DIR . '/ca-ad.pem');
+define('SQAD_LOCK', SQAD_DIR . '/sincronizar.lock');
 
 /* ======================================================================
  *  Funcoes puras (sem pfSense): testadas no CI em tests/
@@ -72,6 +81,19 @@ function sqad_ler_pacote(string $arquivo): array {
 	$p['Setores'] = array_values(array_filter($p['Setores'] ?? [], function ($s) {
 		return is_array($s) && !empty($s['Nome']) && !empty($s['Dn']);
 	}));
+	// v1.1: setores espelhando as OUs + sincronizacao (opcional no arquivo)
+	if (!empty($p['Sync'])) {
+		if (empty($p['Sync']['BaseOu']) || empty($p['Sync']['Prefixo'])) {
+			throw new RuntimeException('Sync.BaseOu e Sync.Prefixo sao obrigatorios quando ha sincronizacao');
+		}
+		foreach ($p['Setores'] as $s) {
+			if (!preg_match('/^[0-9a-f]{32}$/', $s['Guid'] ?? '')) {
+				throw new RuntimeException("setor {$s['Nome']} sem o Guid do AD: gere o arquivo de novo com o Install-SquidAD.ps1 1.1");
+			}
+		}
+	} else {
+		$p['Sync'] = null;
+	}
 	return $p;
 }
 
@@ -236,6 +258,137 @@ function sqad_texto_relatorio(array $agg, array $setores, int $top = 5): string 
 	return $txt;
 }
 
+
+/* ----------------------------------------------------------------------
+ *  SquidGuard (Groups ACL) - funcoes puras
+ * ---------------------------------------------------------------------- */
+
+/*
+ * Nome da regra no SquidGuard a partir do grupo. O SquidGuard do pfSense 2.7
+ * aceita 2 a 16 caracteres [a-zA-Z0-9_-], comecando com letra, e reserva
+ * alguns nomes. NET_EXPEDICAO_INSTRUMENTAL -> EXPEDICAO_INSTR
+ */
+function sqad_nome_acl(string $grupo, string $prefixo, array $usados): string {
+	$base = $grupo;
+	if ($prefixo !== '' && stripos($base, $prefixo) === 0) { $base = substr($base, strlen($prefixo)); }
+	$base = preg_replace('/[^A-Za-z0-9_-]+/', '_', $base);
+	$base = trim($base, '_-');
+	if ($base === '' || !preg_match('/^[A-Za-z]/', $base)) { $base = 'S' . $base; }
+	$reservados = ['acl', 'all', 'allow', 'dbhome', 'default', 'dest', 'in-addr', 'log', 'logdir', 'none', 'pass', 'rew', 'src', 'squidstatus', 'url', 'user'];
+	if (in_array(strtolower($base), $reservados, true)) { $base = 'S_' . $base; }
+	$base = substr($base, 0, 16);
+	if (strlen($base) < 2) { $base = str_pad($base, 2, '_'); }
+	$usados_min = array_map('strtolower', $usados);
+	$nome = $base;
+	for ($i = 2; in_array(strtolower($nome), $usados_min, true); $i++) {
+		$suf = (string)$i;
+		$nome = substr($base, 0, 16 - strlen($suf)) . $suf;
+	}
+	return $nome;
+}
+
+/* Codifica para URL LDAP: mantem so os caracteres seguros e o %s do SquidGuard. */
+function sqad_url_codifica(string $s, string $manter): string {
+	$partes = explode('%s', $s);
+	foreach ($partes as &$pt) {
+		$out = '';
+		foreach (str_split($pt) as $ch) {
+			$out .= (ctype_alnum($ch) || strpos($manter, $ch) !== false) ? $ch : sprintf('%%%02x', ord($ch));
+		}
+		$pt = $out;
+	}
+	unset($pt);
+	return implode('%s', $partes);
+}
+
+/*
+ * Linha de origem do Groups ACL: o SquidGuard procura o usuario (%s) no AD e
+ * confere se ele e membro do grupo (inclusive grupo dentro de grupo).
+ * Mesmo formato do exemplo da tela do pfSense (virgulas do DN como %2c).
+ */
+function sqad_linha_ldapusersearch(array $p, string $grupo_dn): string {
+	$filtro = '(&(sAMAccountName=%s)(memberOf:1.2.840.113556.1.4.1941:=' . sqad_escape_filtro($grupo_dn) . '))';
+	return 'ldapusersearch ' . sqad_url_ldap($p) . '/' . sqad_url_codifica($p['Dominio']['Base'], '=,._-')
+		. '?sAMAccountName?sub?' . sqad_url_codifica($filtro, '()&=:!*._-');
+}
+
+function sqad_marca_acl(string $guid, string $grupo): string {
+	return SQAD_MARCA_ACL . " id={$guid} grupo={$grupo}";
+}
+
+/* id (GUID do grupo no AD) e nome do grupo gravados na descricao da regra; null se a regra nao e do projeto. */
+function sqad_info_acl(array $acl): ?array {
+	if (!preg_match('/^' . preg_quote(SQAD_MARCA_ACL, '/') . ' id=([0-9a-f]+) grupo=(\S+)/', $acl['description'] ?? '', $m)) { return null; }
+	return ['guid' => $m[1], 'grupo' => $m[2]];
+}
+
+function sqad_acl_nova(string $nome, string $origem, string $descricao): array {
+	// mesmos campos que a tela grava; destino "all" = libera tudo
+	return ['disabled' => '', 'name' => $nome, 'source' => $origem, 'time' => '', 'dest' => 'all [ all]',
+		'notallowingip' => '', 'redirect_mode' => 'rmod_none', 'redirect' => '', 'safesearch' => '',
+		'rewrite' => '', 'overrewrite' => '', 'description' => $descricao, 'enablelog' => 'on'];
+}
+
+/*
+ * Sincroniza as regras com os grupos do AD. $grupos = [['Nome','Dn','Guid'], ...]
+ * - grupo novo            -> regra nova (libera tudo)
+ * - grupo renomeado/movido-> atualiza so a origem (destino/horario ficam)
+ * - grupo recriado (mesmo nome, GUID novo) -> reaproveita a regra
+ * - grupo apagado         -> desativa a regra (nao apaga)
+ * Regras que nao sao do projeto nunca sao tocadas. Devolve [acls, mudancas].
+ */
+function sqad_sincronizar_acls(array $acls, array $grupos, array $p, string $prefixo): array {
+	$mud = [];
+	$usados = array_column($acls, 'name');
+	$vistos = [];
+	foreach ($grupos as $g) {
+		$origem = sqad_linha_ldapusersearch($p, $g['Dn']);
+		$achou = null;
+		foreach ($acls as $i => $a) { $inf = sqad_info_acl($a); if ($inf && $inf['guid'] === $g['Guid']) { $achou = $i; break; } }
+		if ($achou === null) {
+			foreach ($acls as $i => $a) {
+				$inf = sqad_info_acl($a);
+				if ($inf && strcasecmp($inf['grupo'], $g['Nome']) === 0 && !in_array($i, $vistos, true)) { $achou = $i; $mud[] = "regra {$a['name']}: grupo {$g['Nome']} foi recriado no AD - regra reaproveitada"; break; }
+			}
+		}
+		if ($achou === null) {
+			$nome = sqad_nome_acl($g['Nome'], $prefixo, $usados);
+			$usados[] = $nome;
+			$acls[] = sqad_acl_nova($nome, $origem, sqad_marca_acl($g['Guid'], $g['Nome']));
+			$vistos[] = count($acls) - 1;
+			$mud[] = "regra {$nome}: CRIADA para o grupo {$g['Nome']} (libera tudo)";
+			continue;
+		}
+		$vistos[] = $achou;
+		$a = &$acls[$achou];
+		if ($a['source'] !== $origem) { $a['source'] = $origem; $mud[] = "regra {$a['name']}: origem atualizada (grupo {$g['Nome']} mudou de lugar/nome no AD)"; }
+		$desc = sqad_marca_acl($g['Guid'], $g['Nome']);
+		if (($a['disabled'] ?? '') === 'on' && strpos($a['description'] ?? '', SQAD_APAGADO) !== false) { $a['disabled'] = ''; $mud[] = "regra {$a['name']}: REATIVADA (grupo {$g['Nome']} voltou no AD)"; }
+		$a['description'] = $desc;   // marca atualizada (nome novo do grupo, sem o "apagado")
+		unset($a);
+	}
+	foreach ($acls as $i => &$a) {
+		$inf = sqad_info_acl($a);
+		if (!$inf || in_array($i, $vistos, true) || ($a['disabled'] ?? '') === 'on') { continue; }
+		$a['disabled'] = 'on';
+		$a['description'] = sqad_marca_acl($inf['guid'], $inf['grupo']) . ' ' . SQAD_APAGADO;
+		$mud[] = "regra {$a['name']}: DESATIVADA (grupo {$inf['grupo']} nao existe mais no AD)";
+	}
+	unset($a);
+	return [$acls, $mud];
+}
+
+/* Liga o LDAP nas General settings do SquidGuard (necessario para o ldapusersearch). */
+function sqad_sg_geral(array $atual, array $p, string $senha): array {
+	$n = $atual;
+	$n['ldap_enable']   = 'on';
+	$n['ldapbinddn']    = $p['Conta']['Dn'];
+	$n['ldapbindpass']  = $senha;
+	$n['ldapversion']   = '3';
+	if (empty($n['ldapcachetime'])) { $n['ldapcachetime'] = '300'; }   // 5 min, igual ao cache do login
+	return $n;
+}
+
 /* ======================================================================
  *  Interacao
  * ====================================================================== */
@@ -387,6 +540,92 @@ function sqad_setores_dos_usuarios(array $estado, array $usuarios): array {
 	return $res;
 }
 
+
+/* SquidGuard instalado e configurado ao menos uma vez? */
+function sqad_sg_instalado(): bool {
+	return file_exists(SQAD_SQUIDGUARDINC) && is_array(config_get_path('installedpackages/squidguardgeneral/config/0'));
+}
+
+/*
+ * Grupos de setor no AD: grupos cujo nome comeca com o prefixo (NET_), dentro
+ * da OU da empresa. Consulta por LDAPS com a conta de servico. Lanca excecao se
+ * o AD nao responder - quem chama NAO muda nada nesse caso.
+ */
+function sqad_ad_grupos(array $p, string $dn_conta, string $senha, string $base_ou, string $prefixo, string $cafile): array {
+	if (isset($GLOBALS['sqad_fake_ad_grupos'])) {   // testes
+		if ($GLOBALS['sqad_fake_ad_grupos'] === 'erro') { throw new RuntimeException('AD fora do ar (simulado)'); }
+		return $GLOBALS['sqad_fake_ad_grupos'];
+	}
+	if (!function_exists('ldap_connect')) { throw new RuntimeException('extensao ldap do PHP ausente'); }
+	if (($p['Servidor']['Transporte'] ?? '') === 'ssl') {
+		ldap_set_option(null, LDAP_OPT_X_TLS_CACERTFILE, $cafile);
+		ldap_set_option(null, LDAP_OPT_X_TLS_REQUIRE_CERT, LDAP_OPT_X_TLS_DEMAND);
+	}
+	$l = @ldap_connect(sqad_url_ldap($p));
+	if (!$l) { throw new RuntimeException('nao consegui abrir a conexao LDAP'); }
+	ldap_set_option($l, LDAP_OPT_PROTOCOL_VERSION, 3);
+	ldap_set_option($l, LDAP_OPT_REFERRALS, 0);
+	ldap_set_option($l, LDAP_OPT_NETWORK_TIMEOUT, 15);
+	if (!@ldap_bind($l, $dn_conta, $senha)) { throw new RuntimeException('login LDAP recusado: ' . ldap_error($l)); }
+	$r = @ldap_search($l, $base_ou, '(&(objectClass=group)(cn=' . sqad_escape_filtro($prefixo) . '*))', ['cn', 'distinguishedName', 'objectGUID']);
+	if (!$r) { throw new RuntimeException('busca de grupos falhou: ' . ldap_error($l)); }
+	$e = ldap_get_entries($l, $r);
+	$g = [];
+	for ($i = 0; $i < $e['count']; $i++) {
+		$g[] = ['Nome' => $e[$i]['cn'][0], 'Dn' => $e[$i]['distinguishedname'][0], 'Guid' => bin2hex($e[$i]['objectguid'][0])];
+	}
+	@ldap_unbind($l);
+	usort($g, function ($a, $b) { return strcasecmp($a['Nome'], $b['Nome']); });
+	return $g;
+}
+
+function sqad_log(string $m): void {
+	if (function_exists('log_error')) { log_error('pfSense-Squid-AD: ' . $m); }
+}
+
+/* Sincroniza o SquidGuard com os grupos de setor do AD (usado pelo cron a cada 15 min). */
+function sqad_cmd_sincronizar(array $opt): int {
+	sqad_carregar_pfsense();
+	$cron = !empty($opt['cron']);
+	$estado = json_decode((string)@file_get_contents(SQAD_ESTADO), true);
+	if (!$estado || empty($estado['Sync'])) { throw new RuntimeException('a sincronizacao nao esta configurada: rode o "aplicar" com o arquivo gerado pela versao 1.1 do Install-SquidAD.ps1'); }
+	if (!sqad_sg_instalado()) { throw new RuntimeException('o SquidGuard nao esta instalado/configurado'); }
+	@mkdir(SQAD_DIR, 0755, true);
+	$lock = fopen(SQAD_LOCK, 'c');
+	if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) { if (!$cron) { sqad_msg('aviso', 'ja existe uma sincronizacao rodando.'); } return 0; }
+	try {
+		$auth = config_get_path('installedpackages/squidauth/config/0', []);
+		$p = ['Servidor' => $estado['Servidor'], 'Dominio' => $estado['Dominio']];
+		$grupos = sqad_ad_grupos($p, $auth['ldap_user'] ?? '', $auth['ldap_pass'] ?? '', $estado['Sync']['BaseOu'], $estado['Sync']['Prefixo'], SQAD_CA);
+		if (!$grupos && !empty($estado['Setores']) && empty($opt['forcar'])) {
+			throw new RuntimeException("o AD devolveu 0 grupos {$estado['Sync']['Prefixo']}* (antes eram " . count($estado['Setores']) . '). Nada foi alterado. Se for isso mesmo, use --forcar');
+		}
+		$acls = config_get_path('installedpackages/squidguardacl/config', []);
+		if (!is_array($acls)) { $acls = []; }
+		[$novas, $mud] = sqad_sincronizar_acls($acls, $grupos, $p, $estado['Sync']['Prefixo']);
+		$estado['Setores'] = array_map(function ($g) { return ['Nome' => $g['Nome'], 'Dn' => $g['Dn']]; }, $grupos);
+		$estado['UltimaSync'] = date('c');
+		$estado['UltimaSyncMudancas'] = count($mud);
+		file_put_contents(SQAD_ESTADO, json_encode($estado, JSON_PRETTY_PRINT));
+		if ($mud) {
+			config_set_path('installedpackages/squidguardacl/config', $novas);
+			write_config('pfSense-Squid-AD: sincronizacao com o AD (' . count($mud) . ' mudanca(s))');
+			require_once(SQAD_SQUIDGUARDINC);
+			squidguard_resync();
+			foreach ($mud as $m) { sqad_msg('ok', $m); sqad_log($m); }
+		} elseif (!$cron) {
+			sqad_msg('ok', 'nada mudou: ' . count($grupos) . ' setor(es) do AD ja estao no SquidGuard.');
+		}
+	} catch (Throwable $e) {
+		sqad_log('sincronizacao falhou (nada foi alterado): ' . $e->getMessage());
+		throw $e;
+	} finally {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+	}
+	return 0;
+}
+
 /* ======================================================================
  *  Comandos
  * ====================================================================== */
@@ -434,6 +673,16 @@ function sqad_cmd_aplicar(string $arquivo, array $opt, bool $simular): int {
 	if ($p['Servidor']['Transporte'] === 'ssl') {
 		sqad_msg('info', 'tambem: CA do AD em ' . SQAD_CA . ' e TLS_CACERT no ' . SQAD_LDAPCONF . ' (bloco marcado)');
 	}
+	$sg = !empty($p['Sync']) && sqad_sg_instalado();
+	if ($sg) {
+		sqad_msg('passo', 'SquidGuard: setores do AD (grupos ' . $p['Sync']['Prefixo'] . '* em ' . $p['Sync']['BaseOu'] . ')');
+		[, $prev] = sqad_sincronizar_acls(config_get_path('installedpackages/squidguardacl/config', []) ?: [], $p['Setores'], $p, $p['Sync']['Prefixo']);
+		fwrite(STDOUT, ($prev ? '  ' . implode("\n  ", $prev) : '  (nada: as regras ja existem)') . "\n");
+		sqad_msg('info', 'tambem: LDAP ligado nas General settings do SquidGuard e sincronizacao automatica a cada 15 min.');
+		sqad_msg('info', 'suas regras (ex.: setor-davs) e a Default nao sao alteradas.');
+	} elseif (!empty($p['Sync'])) {
+		sqad_msg('info', 'SquidGuard nao instalado: os setores ficam so no relatorio.');
+	}
 	if ($simular) {
 		sqad_msg('passo', 'SIMULACAO: nada foi alterado.');
 		sqad_msg('info', "Para aplicar: php squid-ad.php aplicar {$arquivo}" . (stream_isatty(STDIN) ? '' : ' --sim'));
@@ -446,7 +695,9 @@ function sqad_cmd_aplicar(string $arquivo, array $opt, bool $simular): int {
 	$ts = date('Y-m-d_His');
 	copy(SQAD_CONFIGXML, SQAD_BACKUPS . "/config-{$ts}.xml");
 	file_put_contents(SQAD_BACKUPS . "/squidauth-{$ts}.json", json_encode(['squidauth' => $atual,
-		'ldapconf' => (string)@file_get_contents(SQAD_LDAPCONF)], JSON_PRETTY_PRINT));
+		'ldapconf' => (string)@file_get_contents(SQAD_LDAPCONF),
+		'squidguardgeneral' => config_get_path('installedpackages/squidguardgeneral/config/0'),
+		'squidguardacl' => config_get_path('installedpackages/squidguardacl/config')], JSON_PRETTY_PRINT));
 	chmod(SQAD_BACKUPS . "/squidauth-{$ts}.json", 0600);
 	sqad_msg('ok', SQAD_BACKUPS . "/config-{$ts}.xml (config.xml inteiro) e squidauth-{$ts}.json");
 	// O "desfazer" volta para ANTES do projeto: se ja foi aplicado antes, o
@@ -482,7 +733,8 @@ function sqad_cmd_aplicar(string $arquivo, array $opt, bool $simular): int {
 	write_config('pfSense-Squid-AD: autenticacao LDAP no Active Directory');
 	file_put_contents(SQAD_ESTADO, json_encode([
 		'Versao' => SQAD_VERSAO, 'AplicadoEm' => $aplicado_original, 'AtualizadoEm' => date('c'), 'Backup' => $backup_original,
-		'Dominio' => $p['Dominio'], 'Servidor' => $p['Servidor'], 'Setores' => $p['Setores'],
+		'Dominio' => $p['Dominio'], 'Servidor' => $p['Servidor'], 'Setores' => array_map(function ($g) { return ['Nome' => $g['Nome'], 'Dn' => $g['Dn']]; }, $p['Setores']),
+		'Sync' => $p['Sync'] ?? null,
 	], JSON_PRETTY_PRINT));
 	require_once(SQAD_SQUIDINC);
 	squid_resync();
@@ -493,6 +745,40 @@ function sqad_cmd_aplicar(string $arquivo, array $opt, bool $simular): int {
 		sqad_msg('ok', 'squid.conf regenerado com o login LDAP');
 	}
 	sqad_msg('ok', is_process_running('squid') ? 'Squid rodando' : 'Squid NAO esta rodando (ligue em Services > Squid Proxy Server)');
+
+	if ($sg) {
+		sqad_msg('passo', 'SquidGuard: LDAP + uma regra por setor (libera tudo)');
+		if (sqad_pergunta('Ligar o LDAP no SquidGuard e criar/atualizar as regras dos setores?', true, $opt)) {
+			config_set_path('installedpackages/squidguardgeneral/config/0',
+				sqad_sg_geral(config_get_path('installedpackages/squidguardgeneral/config/0', []), $p, $senha));
+			write_config('pfSense-Squid-AD: LDAP no SquidGuard');
+			// Confere tambem a consulta que o cron vai fazer. Se o AD nao responder
+			// por aqui, usa a lista que veio do arquivo e avisa.
+			$grupos = $p['Setores'];
+			try {
+				$grupos = sqad_ad_grupos($p, $p['Conta']['Dn'], $senha, $p['Sync']['BaseOu'], $p['Sync']['Prefixo'], SQAD_CA);
+				sqad_msg('ok', 'consulta de grupos no AD funcionando (' . count($grupos) . ' setor(es))');
+			} catch (Throwable $e) {
+				sqad_msg('aviso', 'a consulta de grupos pelo pfSense falhou (' . $e->getMessage() . '): usando a lista do arquivo. A sincronizacao automatica vai falhar ate isso ser corrigido.');
+			}
+			[$novas, $mud] = sqad_sincronizar_acls(config_get_path('installedpackages/squidguardacl/config', []) ?: [], $grupos, $p, $p['Sync']['Prefixo']);
+			config_set_path('installedpackages/squidguardacl/config', $novas);
+			write_config('pfSense-Squid-AD: regras dos setores no SquidGuard');
+			require_once(SQAD_SQUIDGUARDINC);
+			squidguard_resync();
+			foreach ($mud as $m) { sqad_msg('ok', $m); }
+			if (!$mud) { sqad_msg('ok', 'as regras dos setores ja existiam.'); }
+			if (config_get_path('installedpackages/squidguardgeneral/config/0/squidguard_enable') !== 'on') {
+				sqad_msg('aviso', 'o SquidGuard esta DESLIGADO (Services > SquidGuard Proxy Filter > Enable): as regras so valem quando ligar.');
+			}
+
+			if (sqad_pergunta('Sincronizar automaticamente com o AD a cada 15 minutos (cron)?', true, $opt)) {
+				if (realpath(__FILE__) !== SQAD_SCRIPT_FIXO) { copy(__FILE__, SQAD_SCRIPT_FIXO); chmod(SQAD_SCRIPT_FIXO, 0700); }
+				install_cron_job(SQAD_CRON, true, '*/15');
+				sqad_msg('ok', 'cron instalado: ' . SQAD_CRON . ' (a cada 15 min). Grupo NET_ novo no AD vira regra sozinho.');
+			}
+		}
+	}
 
 	sqad_msg('passo', 'Pronto');
 	sqad_msg('info', 'Os PCs que usam o proxy vao pedir usuario e senha do Windows.');
@@ -553,6 +839,13 @@ function sqad_cmd_status(): int {
 	if ($estado) {
 		sqad_msg('info', "aplicado em:  {$estado['AplicadoEm']} (backup: {$estado['Backup']})");
 		sqad_msg('info', 'setores:      ' . ($estado['Setores'] ? implode(', ', array_column($estado['Setores'], 'Nome')) : 'nenhum'));
+		if (!empty($estado['Sync'])) {
+			sqad_msg('info', "sincronizacao: grupos {$estado['Sync']['Prefixo']}* em {$estado['Sync']['BaseOu']}");
+			sqad_msg('info', 'ultima:       ' . ($estado['UltimaSync'] ?? 'ainda nao rodou') . (isset($estado['UltimaSyncMudancas']) ? " ({$estado['UltimaSyncMudancas']} mudanca(s))" : ''));
+			$tem_cron = false;
+			foreach (config_get_path('cron/item', []) ?: [] as $c) { if (strpos($c['command'] ?? '', 'squid-ad.php sincronizar') !== false) { $tem_cron = true; } }
+			sqad_msg('info', 'cron:         ' . ($tem_cron ? 'a cada 15 min' : 'NAO instalado'));
+		}
 	} else {
 		sqad_msg('info', 'este projeto ainda nao foi aplicado aqui.');
 	}
@@ -568,7 +861,24 @@ function sqad_cmd_desfazer(array $opt): int {
 	sqad_msg('info', 'metodo de autenticacao volta para: ' . ($b['squidauth']['auth_method'] ?? 'none'));
 	if (!sqad_pergunta('Desfazer agora?', true, $opt)) { return 1; }
 	config_set_path('installedpackages/squidauth/config/0', $b['squidauth'] ?: ['auth_method' => 'none']);
+	// SquidGuard: tira so as regras criadas pelo projeto e volta o LDAP das General settings
+	$sg_mexeu = false;
+	$acls = config_get_path('installedpackages/squidguardacl/config', []);
+	if (is_array($acls)) {
+		$sobra = array_values(array_filter($acls, function ($a) { return sqad_info_acl($a) === null; }));
+		if (count($sobra) !== count($acls)) {
+			config_set_path('installedpackages/squidguardacl/config', $sobra);
+			sqad_msg('ok', (count($acls) - count($sobra)) . ' regra(s) do projeto removida(s) do SquidGuard (as suas ficaram).');
+			$sg_mexeu = true;
+		}
+	}
+	if (array_key_exists('squidguardgeneral', $b) && is_array($b['squidguardgeneral'])) {
+		config_set_path('installedpackages/squidguardgeneral/config/0', $b['squidguardgeneral']);
+		$sg_mexeu = true;
+	}
+	if (function_exists('install_cron_job')) { install_cron_job(SQAD_CRON, false); }
 	write_config('pfSense-Squid-AD: desfeito (autenticacao restaurada)');
+	if ($sg_mexeu && file_exists(SQAD_SQUIDGUARDINC)) { require_once(SQAD_SQUIDGUARDINC); squidguard_resync(); }
 	file_put_contents(SQAD_LDAPCONF, sqad_bloco_ldapconf((string)@file_get_contents(SQAD_LDAPCONF), null));
 	require_once(SQAD_SQUIDINC);
 	squid_resync();
@@ -586,6 +896,8 @@ function sqad_opcoes(array $argv): array {
 	for ($i = 1; $i < count($argv); $i++) {
 		$a = $argv[$i];
 		if ($a === '--sim' || $a === '-y') { $o['sim'] = true; }
+		elseif ($a === '--cron') { $o['cron'] = true; $o['sim'] = true; }
+		elseif ($a === '--forcar') { $o['forcar'] = true; }
 		elseif (preg_match('/^--(dias|usuario|csv)$/', $a, $m)) { $o[$m[1]] = $argv[++$i] ?? ''; }
 		else { $o['pos'][] = $a; }
 	}
@@ -595,7 +907,9 @@ function sqad_opcoes(array $argv): array {
 function sqad_main(array $argv): int {
 	$o = sqad_opcoes($argv);
 	$cmd = $o['pos'][0] ?? '';
-	fwrite(STDOUT, "\n  pfSense-Squid-AD " . SQAD_VERSAO . " - login do Squid no Active Directory\n");
+	if (($o['pos'][0] ?? '') !== 'sincronizar' || empty($o['cron'])) {
+		fwrite(STDOUT, "\n  pfSense-Squid-AD " . SQAD_VERSAO . " - login do Squid no Active Directory\n");
+	}
 	try {
 		switch ($cmd) {
 			case 'simular':   return sqad_cmd_aplicar($o['pos'][1] ?? '', $o, true);
@@ -603,10 +917,12 @@ function sqad_main(array $argv): int {
 			case 'testar':    return sqad_cmd_testar($o['pos'][1] ?? sqad_ler_texto('Usuario'));
 			case 'relatorio': return sqad_cmd_relatorio($o);
 			case 'status':    return sqad_cmd_status();
+			case 'sincronizar': return sqad_cmd_sincronizar($o);
 			case 'desfazer':  return sqad_cmd_desfazer($o);
 			default:
 				fwrite(STDOUT, "\n  Uso: php squid-ad.php simular|aplicar <arquivo.json> [--sim]\n"
-					. "       php squid-ad.php testar <usuario> | relatorio [--dias N] [--usuario X] [--csv arq] | status | desfazer\n");
+					. "       php squid-ad.php testar <usuario> | relatorio [--dias N] [--usuario X] [--csv arq] | status | desfazer\n"
+					. "       php squid-ad.php sincronizar [--forcar]   (o cron roda a cada 15 min)\n");
 				return $cmd === '' ? 0 : 2;
 		}
 	} catch (Throwable $e) {

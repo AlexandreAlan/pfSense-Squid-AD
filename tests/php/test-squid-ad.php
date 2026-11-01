@@ -21,6 +21,8 @@ define('SQAD_SQUIDINC',    "$W/squid.inc");
 define('SQAD_ACCESSLOG',   "$W/access.log");
 define('SQAD_CONFIGXML',   "$W/config.xml");
 define('SQAD_VERSIONFILE', "$W/version");
+define('SQAD_SQUIDGUARDINC', "$W/squidguard.inc");
+define('SQAD_SCRIPT_FIXO', "$W/root-squid-ad.php");
 
 /* ---------------- pfSense simulado ---------------- */
 $GLOBALS['cfg'] = [];
@@ -41,6 +43,10 @@ function config_path_enabled(string $path, $enable_key = 'enable') { return conf
 function write_config($desc = '') { $GLOBALS['writes'][] = $desc; }
 function is_process_running($p) { return true; }
 function services_unbound_configure() { $GLOBALS['unbound'] = ($GLOBALS['unbound'] ?? 0) + 1; }
+function install_cron_job($cmd, $ativo = false, $min = '0') { $GLOBALS['cron'][$cmd] = $ativo ? $min : null; if (!$ativo) { unset($GLOBALS['cron'][$cmd]); } }
+function log_error($m) { $GLOBALS['syslog'][] = $m; }
+$GLOBALS['cron'] = []; $GLOBALS['sg_resyncs'] = 0;
+file_put_contents(SQAD_SQUIDGUARDINC, '<?php function squidguard_resync() { $GLOBALS["sg_resyncs"]++; }');
 file_put_contents(SQAD_SQUIDINC, '<?php function squid_resync() { $GLOBALS["resyncs"]++; $a = config_get_path("installedpackages/squidauth/config/0", []);'
 	. ' file_put_contents(SQAD_SQUIDCONF, ($a["auth_method"] ?? "") === "ldap" ? "auth_param basic program /x/basic_ldap_auth -H ldaps://{$a["auth_server"]}\n" : "# sem auth\n"); }');
 file_put_contents(SQAD_VERSIONFILE, "2.7.0-RELEASE\n");
@@ -52,6 +58,12 @@ $GLOBALS['cfg']['installedpackages']['squid']['config'][0] = ['enable_squid' => 
 $AUTH_ANTES = ['auth_method' => 'none', 'no_auth_hosts' => base64_encode("172.16.10.5/32"), 'max_user_ip' => '2'];
 $GLOBALS['cfg']['installedpackages']['squidauth']['config'][0] = $AUTH_ANTES;
 $GLOBALS['cfg']['unbound']['enable'] = '';
+// SquidGuard como na AGF: uma regra manual (setor-davs) e LDAP desligado
+$SG_GERAL_ANTES = ['squidguard_enable' => 'on', 'ldap_enable' => '', 'ldapversion' => '3', 'ldapcachetime' => '0'];
+$ACL_MANUAL = ['disabled' => '', 'name' => 'setor-davs', 'source' => "'alexandre.alan'", 'time' => '', 'dest' => '!bloq_davs all [ all]',
+	'notallowingip' => '', 'redirect_mode' => 'rmod_none', 'redirect' => '', 'safesearch' => '', 'rewrite' => '', 'overrewrite' => '', 'description' => '', 'enablelog' => 'on'];
+$GLOBALS['cfg']['installedpackages']['squidguardgeneral']['config'][0] = $SG_GERAL_ANTES;
+$GLOBALS['cfg']['installedpackages']['squidguardacl']['config'] = [$ACL_MANUAL];
 
 require __DIR__ . '/../../pfsense/squid-ad.php';
 
@@ -66,6 +78,8 @@ function cenario(string $nome, callable $f) {
 function confere($cond, string $msg) { if (!$cond) { throw new Exception($msg); } }
 
 $PAC = json_decode(file_get_contents($pacote), true);
+// o AD (via LDAP, simulado) devolve os mesmos grupos que vieram no arquivo
+$GLOBALS['sqad_fake_ad_grupos'] = $PAC['Setores'];
 $SVC_SENHA = $PAC['Conta']['Senha'];
 putenv('SQAD_FAKE_SVC_SENHA=' . $SVC_SENHA);
 putenv('SQAD_FAKE_CONTAS=' . json_encode([$PAC['Conta']['Usuario'] => $SVC_SENHA, 'joao.silva' => 'Senh@ "dificil" \\ c$o:`']));
@@ -73,7 +87,8 @@ putenv('SQAD_FAKE_CONTAS=' . json_encode([$PAC['Conta']['Usuario'] => $SVC_SENHA
 fwrite(STDERR, "1) Pacote vindo do AD (contrato com o Install-SquidAD.ps1)\n");
 cenario('o JSON do PowerShell e aceito', function () use ($pacote) {
 	$p = sqad_ler_pacote($pacote);
-	confere(count($p['Setores']) === 2, 'setores');
+	confere(count($p['Setores']) === 4, 'setores: ' . count($p['Setores']));
+	confere($p['Sync']['Prefixo'] === 'NET_', 'Sync');
 	confere($p['Servidor']['Transporte'] === 'ssl', 'transporte');
 	return '(' . implode(', ', array_column($p['Setores'], 'Nome')) . ')';
 });
@@ -113,6 +128,64 @@ cenario('argumentos do helper iguais aos do pacote Squid, senha por arquivo', fu
 	$a = sqad_args_helper($PAC, '/tmp/s');
 	confere(in_array('-W', $a, true) && !in_array('-w', $a, true), 'senha por -W');
 	confere($a[array_search('-H', $a) + 1] === 'ldaps://localhost:636', 'URL');
+});
+
+fwrite(STDERR, "2b) SquidGuard: nomes, linha ldapusersearch e sincronizacao (funcoes)\n");
+cenario('nome da regra: max 16, comeca com letra, sem reservados, unico', function () {
+	confere(sqad_nome_acl('NET_EXPEDICAO_INSTRUMENTAL', 'NET_', []) === 'EXPEDICAO_INSTRU', sqad_nome_acl('NET_EXPEDICAO_INSTRUMENTAL', 'NET_', []));
+	confere(sqad_nome_acl('NET_FINANCEIRO', 'NET_', ['FINANCEIRO']) === 'FINANCEIRO2', 'unico');
+	confere(sqad_nome_acl('NET_DEFAULT', 'NET_', []) === 'S_DEFAULT', 'reservado');
+	confere(sqad_nome_acl('NET_2024', 'NET_', []) === 'S2024', 'comeca com letra');
+	foreach (['NET_A', 'NET_SUPORTE_TERCEIRIZADO_X', 'NET_X-Y'] as $g) {
+		$n = sqad_nome_acl($g, 'NET_', []);
+		confere(preg_match('/^[A-Za-z][A-Za-z0-9_-]{1,15}$/', $n) === 1, "formato invalido: $n");
+	}
+});
+cenario('linha ldapusersearch: decodificada volta exatamente ao filtro e ao DN', function () use ($PAC) {
+	$dn = "CN=NET_EXPEDICAO_INSTRUMENTAL,OU=Expedi\xc3\xa7\xc3\xa3o Instrumental,OU=AGF,DC=teste,DC=local";
+	$l = sqad_linha_ldapusersearch($PAC, $dn);
+	confere(strpos($l, 'ldapusersearch ldaps://localhost:636/DC=teste,DC=local?sAMAccountName?sub?') === 0, $l);
+	confere(strpos($l, ' ', strlen('ldapusersearch ')) === false, 'tem espaco dentro da URL: ' . $l);
+	confere(strpos($l, '%2c') !== false && strpos($l, '%c3%a7') !== false, 'virgula/acento nao codificados: ' . $l);
+	confere(strpos($l, '(sAMAccountName=%s)') !== false, 'o %s do SquidGuard foi codificado');
+	$filtro = rawurldecode(explode('?', $l)[3]);
+	confere($filtro === "(&(sAMAccountName=%s)(memberOf:1.2.840.113556.1.4.1941:={$dn}))", 'decodificado: ' . $filtro);
+});
+$G = function ($nome, $guid, $ou = 'Setores') { return ['Nome' => $nome, 'Dn' => "CN={$nome},OU={$ou},OU=AGF,DC=teste,DC=local", 'Guid' => $guid]; };
+cenario('sincronizar regras: cria, nao duplica, preserva a regra manual', function () use ($PAC, $G, $ACL_MANUAL) {
+	$g = [$G('NET_FINANCEIRO', str_repeat('a', 32)), $G('NET_COMERCIAL', str_repeat('b', 32))];
+	[$a1, $m1] = sqad_sincronizar_acls([$ACL_MANUAL], $g, $PAC, 'NET_');
+	confere(count($a1) === 3 && count($m1) === 2, 'criou: ' . json_encode($m1));
+	confere($a1[0] === $ACL_MANUAL, 'mexeu na setor-davs');
+	confere($a1[1]['dest'] === 'all [ all]' && $a1[1]['disabled'] === '', 'regra nova libera tudo');
+	[$a2, $m2] = sqad_sincronizar_acls($a1, $g, $PAC, 'NET_');
+	confere($a2 === $a1 && $m2 === [], 'segunda vez mudou: ' . json_encode($m2));
+});
+cenario('grupo movido: so a origem muda, as restricoes do admin ficam', function () use ($PAC, $G) {
+	$g = [$G('NET_FINANCEIRO', str_repeat('a', 32))];
+	[$a] = sqad_sincronizar_acls([], $g, $PAC, 'NET_');
+	$a[0]['dest'] = '!jogos !redes_sociais all [ all]';   // admin restringiu na tela
+	$a[0]['time'] = 'expediente';
+	[$b, $m] = sqad_sincronizar_acls($a, [$G('NET_FINANCEIRO', str_repeat('a', 32), 'Financeiro')], $PAC, 'NET_');
+	confere(count($m) === 1 && strpos($m[0], 'origem atualizada') !== false, json_encode($m));
+	confere($b[0]['dest'] === '!jogos !redes_sociais all [ all]' && $b[0]['time'] === 'expediente', 'perdeu a restricao');
+	confere(strpos($b[0]['source'], 'OU%3dFinanceiro') !== false || strpos($b[0]['source'], 'OU=Financeiro') !== false, 'origem nova');
+});
+cenario('grupo apagado: desativa; recriado com o mesmo nome: reativa a mesma regra', function () use ($PAC, $G) {
+	[$a] = sqad_sincronizar_acls([], [$G('NET_COMERCIAL', str_repeat('b', 32))], $PAC, 'NET_');
+	$a[0]['dest'] = '!jogos all [ all]';
+	[$b, $m] = sqad_sincronizar_acls($a, [], $PAC, 'NET_');
+	confere($b[0]['disabled'] === 'on' && strpos($b[0]['description'], SQAD_APAGADO) !== false, 'desativou: ' . json_encode($b[0]));
+	[$b2, $m2] = sqad_sincronizar_acls($b, [], $PAC, 'NET_');
+	confere($m2 === [], 'desativou de novo: ' . json_encode($m2));
+	[$c, $m3] = sqad_sincronizar_acls($b, [$G('NET_COMERCIAL', str_repeat('c', 32))], $PAC, 'NET_');
+	confere(count($c) === 1 && $c[0]['disabled'] === '' && $c[0]['dest'] === '!jogos all [ all]', 'reativou: ' . json_encode($c));
+	confere(sqad_info_acl($c[0])['guid'] === str_repeat('c', 32), 'GUID novo gravado');
+});
+cenario('LDAP no SquidGuard: liga, mantem o resto', function () use ($PAC, $SG_GERAL_ANTES) {
+	$n = sqad_sg_geral($SG_GERAL_ANTES, $PAC, 'x');
+	confere($n['ldap_enable'] === 'on' && $n['ldapbinddn'] === $PAC['Conta']['Dn'] && $n['ldapcachetime'] === '300', json_encode($n));
+	confere($n['squidguard_enable'] === 'on', 'mexeu no resto');
 });
 
 fwrite(STDERR, "3) Log do Squid e relatorio\n");
@@ -162,11 +235,20 @@ cenario('aplicar --sim: backup, CA, teste do helper, config e Squid reiniciado',
 	confere(count(glob(SQAD_BACKUPS . '/config-*.xml')) === 1 && count(glob(SQAD_BACKUPS . '/squidauth-*.json')) === 1, 'backups');
 	confere($GLOBALS['resyncs'] === 1 && strpos(file_get_contents(SQAD_SQUIDCONF), 'basic_ldap_auth') !== false, 'resync');
 	confere(is_readable(SQAD_ESTADO), 'estado');
+	// v1.1: SquidGuard
+	$sg = config_get_path('installedpackages/squidguardgeneral/config/0');
+	confere($sg['ldap_enable'] === 'on' && $sg['ldapbindpass'] === $PAC['Conta']['Senha'], 'LDAP do SquidGuard');
+	$acls = config_get_path('installedpackages/squidguardacl/config');
+	confere(count($acls) === 5 && $acls[0]['name'] === 'setor-davs', 'regras: ' . json_encode(array_column($acls, 'name')));
+	confere($GLOBALS['sg_resyncs'] >= 1, 'Apply do SquidGuard');
+	confere(($GLOBALS['cron'][SQAD_CRON] ?? null) === '*/15', 'cron: ' . json_encode($GLOBALS['cron']));
+	confere(is_readable(SQAD_SCRIPT_FIXO), 'script copiado para /root');
 });
-cenario('aplicar de novo nao duplica o bloco do ldap.conf', function () use ($pacote) {
+cenario('aplicar de novo nao duplica o bloco do ldap.conf nem as regras', function () use ($pacote) {
 	sleep(1);   // backup com outro nome
 	sqad_cmd_aplicar($pacote, ['sim' => true], false);
 	confere(substr_count(file_get_contents(SQAD_LDAPCONF), SQAD_MARCA_INI) === 1, 'duplicou');
+	confere(count(config_get_path('installedpackages/squidguardacl/config')) === 5, 'duplicou regras');
 });
 cenario('senha errada da conta: o AD recusa e o Squid NAO e alterado', function () use ($pacote, $W) {
 	$p = json_decode(file_get_contents($pacote), true); $p['Conta']['Senha'] = 'errada';
@@ -183,12 +265,54 @@ cenario('relatorio roda em cima do access.log', function () use ($LOG) {
 	confere(preg_match('/maria\.souza;"?SEM SETOR/', file_get_contents(SQAD_DIR . '/r.csv')) === 1, 'csv');
 });
 cenario('status roda', function () { confere(sqad_cmd_status() === 0, 'retorno'); });
-cenario('desfazer --sim volta tudo como era', function () use ($AUTH_ANTES) {
+
+fwrite(STDERR, "5) Sincronizacao (cron a cada 15 min)\n");
+cenario('sincronizar sem mudanca: nao grava nem faz Apply', function () {
+	$w = count($GLOBALS['writes']); $r = $GLOBALS['sg_resyncs'];
+	confere(sqad_cmd_sincronizar(['cron' => true, 'sim' => true]) === 0, 'retorno');
+	confere(count($GLOBALS['writes']) === $w && $GLOBALS['sg_resyncs'] === $r, 'gravou/aplicou sem precisar');
+});
+cenario('grupo novo no AD vira regra; apagado e desativado', function () use ($G) {
+	$antes = $GLOBALS['sqad_fake_ad_grupos'];
+	$GLOBALS['sqad_fake_ad_grupos'] = array_merge(array_slice($antes, 1), [$G('NET_LICITACAO', str_repeat('d', 32))]);
+	$r = $GLOBALS['sg_resyncs'];
+	sqad_cmd_sincronizar(['cron' => true, 'sim' => true]);
+	$acls = config_get_path('installedpackages/squidguardacl/config');
+	$nomes = array_column($acls, 'name');
+	confere(in_array('LICITACAO', $nomes, true), 'nova: ' . json_encode($nomes));
+	$apagada = array_values(array_filter($acls, function ($a) { return ($a['disabled'] ?? '') === 'on'; }));
+	confere(count($apagada) === 1, 'desativada: ' . json_encode($apagada));
+	confere($GLOBALS['sg_resyncs'] === $r + 1, 'Apply');
+	$e = json_decode(file_get_contents(SQAD_ESTADO), true);
+	confere(in_array('NET_LICITACAO', array_column($e['Setores'], 'Nome'), true), 'relatorio sabe do setor novo');
+	confere(!empty($GLOBALS['syslog']), 'log no syslog');
+	$GLOBALS['sqad_fake_ad_grupos'] = $antes;
+	sqad_cmd_sincronizar(['cron' => true, 'sim' => true]);   // volta
+});
+cenario('AD fora do ar: NADA muda (nao desativa tudo)', function () {
+	$antes = config_get_path('installedpackages/squidguardacl/config');
+	$g = $GLOBALS['sqad_fake_ad_grupos']; $GLOBALS['sqad_fake_ad_grupos'] = 'erro';
+	confere(sqad_main(['squid-ad.php', 'sincronizar', '--cron']) === 1, 'deveria falhar');
+	confere(config_get_path('installedpackages/squidguardacl/config') === $antes, 'mexeu nas regras');
+	$GLOBALS['sqad_fake_ad_grupos'] = $g;
+});
+cenario('AD devolveu 0 grupos de repente: para, a nao ser com --forcar', function () {
+	$antes = config_get_path('installedpackages/squidguardacl/config');
+	$g = $GLOBALS['sqad_fake_ad_grupos']; $GLOBALS['sqad_fake_ad_grupos'] = [];
+	confere(sqad_main(['squid-ad.php', 'sincronizar', '--cron']) === 1, 'deveria parar');
+	confere(config_get_path('installedpackages/squidguardacl/config') === $antes, 'mexeu');
+	$GLOBALS['sqad_fake_ad_grupos'] = $g;
+});
+cenario('desfazer --sim volta tudo como era', function () use ($AUTH_ANTES, $ACL_MANUAL, $SG_GERAL_ANTES) {
 	$rc = sqad_cmd_desfazer(['sim' => true]);
 	confere($rc === 0, "retorno $rc");
 	confere(config_get_path('installedpackages/squidauth/config/0') === $AUTH_ANTES, 'squidauth: ' . json_encode(config_get_path('installedpackages/squidauth/config/0')));
 	confere(file_get_contents(SQAD_LDAPCONF) === "# ldap.conf de antes\nBASE dc=antigo\n", 'ldap.conf: ' . json_encode(file_get_contents(SQAD_LDAPCONF)));
 	confere(!file_exists(SQAD_ESTADO), 'estado');
+	$acls = config_get_path('installedpackages/squidguardacl/config');
+	confere($acls === [$ACL_MANUAL], 'so a regra manual deveria ficar: ' . json_encode(array_column($acls, 'name')));
+	confere(config_get_path('installedpackages/squidguardgeneral/config/0') === $SG_GERAL_ANTES, 'LDAP do SquidGuard voltou');
+	confere(!isset($GLOBALS['cron'][SQAD_CRON]), 'cron removido');
 });
 cenario('Host Override no formato da tela do pfSense', function () use ($PAC) {
 	$GLOBALS['cfg']['unbound'] = ['enable' => ''];

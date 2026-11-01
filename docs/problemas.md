@@ -23,6 +23,16 @@
 | `o modo TRANSPARENTE esta ligado` | O proxy está transparente | O login só vale para PCs com o proxy configurado |
 | `o Squid esta DESLIGADO` | *Enable Squid Proxy* desmarcado | Ligar em *Services › Squid Proxy Server* |
 
+## Sincronização
+
+| Mensagem | Causa provável | O que fazer |
+|---|---|---|
+| `sincronizacao falhou (nada foi alterado)` | O pfSense não alcançou o AD (rede, DC desligado, senha da conta trocada) | Nada se perdeu. Ver a mensagem; `php /root/squid-ad.php sincronizar` para testar |
+| `o AD devolveu 0 grupos NET_*` | Prefixo trocado, OU da empresa renomeada ou grupos apagados | Conferir no AD. Se for intencional: `sincronizar --forcar` |
+| Evento **2001** no AD | A tarefa agendada falhou | Ver `C:\ProgramData\pfSense-Squid-AD\sincronizacao.log` |
+| Pessoa saiu do grupo sem querer | O espelhamento tirou quem não está na OU | Mover a pessoa para a OU certa, ou usar `[proxy-manual]` na descrição dela |
+| Regra do setor não aparece no SquidGuard | Sincronização ainda não rodou | Esperar 15 min ou rodar `sincronizar` |
+
 ## No dia a dia
 
 | Sintoma | Causa provável | O que fazer |

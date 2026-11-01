@@ -15,8 +15,11 @@ Login do **proxy Squid do pfSense** com o **usuário e a senha do Active Directo
 - **Conta de serviço só leitura**, com senha aleatória, criada e testada pelo script.
 - **Testa antes de aplicar**, com o mesmo helper que o Squid usa. Se o teste falhar, o Squid não é alterado.
 - **Backup e `desfazer`:** volta a autenticação como estava antes do projeto.
+- **Setores = OUs de departamento:** cada OU ganha um grupo só de internet (`NET_FINANCEIRO`...), que vira uma regra no **SquidGuard** liberando tudo, pronta para restringir.
+- **Sincronização automática a cada 15 min:** OU nova, usuário que mudou de departamento ou grupo apagado são refletidos no AD e no pfSense sozinhos. As restrições que você coloca nunca são sobrescritas.
 - **Relatório por usuário e setor:** quem acessa o quê, com destaque para quem está **sem setor**.
 - **GPO opcional** que configura o proxy nos PCs, setor por setor.
+- **Senha da conta de serviço mostrada no fim**, para guardar no cofre de senhas.
 
 ## Como funciona
 
@@ -26,7 +29,7 @@ Login do **proxy Squid do pfSense** com o **usuário e a senha do Active Directo
   do Windows)              2. confere a senha  3. libera
 ```
 
-O pfSense **não copia** usuários: a cada login ele pergunta ao AD. Funcionário novo, conta desativada ou senha trocada valem na hora. Nesta versão **todos os usuários autenticados acessam tudo**. Os setores servem para monitorar primeiro e restringir depois. Detalhes e limitações em [Como funciona](docs/conceitos.md).
+O pfSense **não copia** usuários: a cada login ele pergunta ao AD. Funcionário novo, conta desativada ou senha trocada valem na hora. Nesta versão **todos os usuários autenticados acessam tudo**: cada setor tem a sua regra no SquidGuard liberando tudo, e para restringir basta editar a regra na tela. Detalhes em [Como funciona](docs/conceitos.md) e [Setores e sincronização](docs/setores.md).
 
 ## Requisitos
 
@@ -68,14 +71,15 @@ php /tmp/squid-ad.php relatorio --dias 7
 |---|---|
 | [Como funciona](docs/conceitos.md) | O login, os setores, limitações e segurança |
 | [Passo 1: AD](docs/ad.md) | O que o script pergunta, LDAPS, setores, GPO |
+| [Setores e sincronização](docs/setores.md) | OU → grupo `NET_` → regra no SquidGuard, sincronização a cada 15 min, exceções |
 | [Passo 2: pfSense](docs/pfsense.md) | Enviar, simular, aplicar, testar, desfazer |
 | [Relatório](docs/relatorio.md) | Monitorar acessos por usuário e setor, exportar CSV |
 | [Problemas comuns](docs/problemas.md) | Cada mensagem de erro e o que fazer |
 | [Desenvolvimento](docs/desenvolvimento.md) | Estrutura, testes e próximos passos |
 
-## Próximos passos
+## Histórico
 
-Restrição de acesso **por setor** com o SquidGuard: o projeto vai gerar as regras de cada grupo do AD prontas.
+Veja o [CHANGELOG](CHANGELOG.md).
 
 ## Licença
 

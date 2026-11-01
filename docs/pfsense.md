@@ -43,6 +43,8 @@ php /tmp/squid-ad.php aplicar /tmp/squid-ad-AGFMEDICAL.json --sim
 6. **CA do AD** em `/usr/local/etc/squid-ad/ca-ad.pem`, com um bloco marcado no `/usr/local/etc/openldap/ldap.conf`. É de lá que o helper LDAP do Squid lê a CA.
 7. **Testa o login** com o **mesmo helper do Squid** (`basic_ldap_auth`), com a conta de serviço e, por SSH, também com um usuário real. **Se o teste falhar, o Squid não é alterado.**
 8. **Aplica** os campos de autenticação, grava o `config.xml` e reinicia o Squid, igual ao botão *Save* da tela.
+9. **SquidGuard** (se instalado): liga o LDAP nas *General settings*, cria **uma regra por setor** no *Groups ACL* (liberando tudo) e faz o *Apply*. As regras que você já tinha ficam como estão.
+10. **Cron:** instala a sincronização a cada 15 minutos (`php /root/squid-ad.php sincronizar --cron`) e copia o script para `/root`. Veja [Setores e sincronização](setores.md).
 
 Os campos que o script preenche (os mesmos da tela *Services › Squid Proxy Server › Authentication*):
 
@@ -65,8 +67,9 @@ O resto da tela (redes sem autenticação, limites, TTL) **é preservado**.
 |---|---|
 | `php /tmp/squid-ad.php testar joao.silva` | Testa o login de um usuário e mostra o setor dele |
 | `php /tmp/squid-ad.php relatorio` | Quem acessa o quê ([detalhes](relatorio.md)) |
-| `php /tmp/squid-ad.php status` | Mostra o estado atual |
-| `php /tmp/squid-ad.php desfazer` | Volta a autenticação como estava **antes do projeto** (`--sim` na tela Command Prompt) |
+| `php /root/squid-ad.php sincronizar` | Traz agora os grupos de setor do AD para o SquidGuard (o cron faz isso a cada 15 min) |
+| `php /tmp/squid-ad.php status` | Mostra o estado atual, a última sincronização e o cron |
+| `php /tmp/squid-ad.php desfazer` | Volta tudo como estava **antes do projeto**: autenticação, LDAP do SquidGuard, remove as regras criadas pelo projeto e o cron (`--sim` na tela Command Prompt) |
 
 > O `/tmp` do pfSense é apagado no reboot. Para usar os comandos depois, copie o script para um lugar fixo: `cp /tmp/squid-ad.php /root/`.
 

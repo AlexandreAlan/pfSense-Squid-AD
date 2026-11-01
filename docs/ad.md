@@ -23,11 +23,13 @@ O script **descobre sozinho** o domínio, os controladores e os grupos. Cada per
 | **1. Domínio** | `agfmedical.local (NetBIOS AGFMEDICAL)` | ENTER |
 | **2. Controlador** | Lista dos DCs com nome e IP, marcando "este servidor" | o número (ENTER = este) |
 | **3. LDAPS** | Certificado do DC: nome, validade, quem emitiu | — (só confere) |
-| **4. Setores** | Grupos que parecem setores (`SETOR-*`, `DEP-*`, `GRP-*`...) | **S/N** em cada um. Também pode ver os outros grupos ou **criar grupos novos** |
+| **4. Setores** | A OU da empresa (ex.: `AGF`) e as OUs de departamento dentro dela | ENTER na OU, **S** para "cada OU é um departamento", o prefixo (`NET_`), e **S/N** para criar cada grupo e colocar nele os usuários da OU |
 | **5. Conta de serviço** | `svc-squid-ldap` (cria ou reaproveita) | ENTER / S |
 | **6. Teste** | Login LDAPS com a conta; quantos usuários ativos e quantos em cada setor | S para testar também com **um usuário real** (mostra o setor dele) |
 | **7. GPO (opcional)** | GPO de proxy para os PCs | N, ou S e os dados do proxy |
 | **8. Arquivo** | `squid-ad-AGFMEDICAL.json` para o pfSense | S para incluir a senha da conta de serviço |
+| **9. Sincronização** | Tarefa agendada a cada 15 min | S |
+| **Fim** | **A senha da conta de serviço**, em destaque | Guarde no cofre de senhas: ela não fica em nenhum log |
 
 ## LDAPS: se o controlador não tiver certificado
 
@@ -60,9 +62,10 @@ O LDAPS exige um certificado de servidor no controlador de domínio. Se o passo 
 
 ## Setores
 
-- O script reconhece grupos com nomes como `SETOR-FINANCEIRO`, `SETOR_COMPRAS`, `DEP-TI` ou `GRP-RH`, ou com "setor"/"departamento" na descrição.
-- Grupos dentro de grupos contam: um usuário de `TI-SUPORTE` dentro de `SETOR-TI` é do setor TI.
-- **Pode começar sem setor nenhum.** Todos acessam tudo e aparecem como "SEM SETOR" no relatório. Depois é só rodar o script de novo e escolher os setores.
+- **Cada OU de departamento ganha um grupo só de internet**, com o prefixo escolhido: `OU=Financeiro` → `NET_FINANCEIRO`, criado **dentro** da OU. Nomes com acento viram sem acento (`Expedição Instrumental` → `NET_EXPEDICAO_INSTRUMENTAL`).
+- Os grupos **espelham a OU**: o script coloca neles os usuários ativos que estão na OU. Para alguém de fora ficar num grupo, use `[proxy-manual]` na descrição do usuário. Detalhes em [Setores e sincronização](setores.md).
+- **Usuários direto na OU da empresa**, fora dos departamentos, são listados: eles ficam "SEM SETOR".
+- Se o domínio **não** tiver OUs de departamento, o script deixa escolher grupos que já existem.
 
 ## GPO do proxy (opcional)
 

@@ -27,7 +27,7 @@ Cada setor é um **grupo do AD** (ex.: `SETOR-FINANCEIRO`). Nesta versão:
 | Usuário **sem setor** | Também acessa tudo, mas aparece **destacado como "SEM SETOR - acessando tudo"** |
 | Conta desativada, senha errada | Não navega (a janela pede a senha de novo) |
 
-A ideia é **monitorar primeiro**: ver quem acessa o quê, por setor, organizar os grupos no AD e só depois restringir. A restrição por setor (SquidGuard) é o próximo passo do projeto.
+A ideia é **monitorar primeiro**: ver quem acessa o quê, por setor, e só depois restringir. Cada setor já tem a sua regra no SquidGuard liberando tudo: para restringir, edite a regra e escolha as *Target categories*. Veja [Setores e sincronização](setores.md).
 
 ## Limitações que você precisa conhecer
 

@@ -1,0 +1,22 @@
+# Histórico de versões
+
+## [1.1.0] — 2026-11-01
+
+### Adicionado
+- **Setores por OU de departamento:** o script do AD cria um grupo só de internet por OU (`NET_<DEPARTAMENTO>`, dentro da OU) e coloca nele os usuários ativos da OU.
+- **Regras no SquidGuard:** cada setor vira uma regra no *Groups ACL*, com origem `ldapusersearch` para o grupo do AD e destino "libera tudo". O LDAP das *General settings* do SquidGuard é ligado automaticamente.
+- **Sincronização automática a cada 15 minutos:** tarefa agendada no AD (OU nova vira grupo, usuário que mudou de departamento troca de grupo) e cron no pfSense (grupo novo vira regra; movido atualiza a origem; apagado desativa a regra; recriado reativa). As restrições configuradas na tela nunca são sobrescritas.
+- Exceção manual: usuário com `[proxy-manual]` na descrição nunca é removido de um grupo pela sincronização.
+- Comando `sincronizar` no pfSense; `status` mostra a última sincronização e o cron; `desfazer` remove regras, LDAP do SquidGuard e cron criados pelo projeto.
+- A senha da conta de serviço é mostrada no fim do script do AD, para guardar no cofre de senhas.
+
+### Corrigido (vistos no primeiro uso real)
+- IP 169.254 (APIPA) do controlador ignorado; preferência pelo IP da placa com gateway; aviso só quando o IP está de fato no DNS.
+- A escolha do controlador aceita o número ou o nome; "S" numa pergunta de valor aceita o padrão.
+- Nomes do certificado sem o GUID do objeto que o SAN de um DC traz.
+- Senha de usuário recusada no teste explica as causas comuns.
+- O gerador de senha não usa mais `#` (vira comentário no `squidGuard.conf`).
+
+## [1.0.0] — 2026-11-01
+
+- Login do Squid via LDAPS no AD: script do AD (domínio, DC, LDAPS, conta de serviço, teste, GPO opcional) e script do pfSense (simular, aplicar, testar, relatório, status, desfazer).

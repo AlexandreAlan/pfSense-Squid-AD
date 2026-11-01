@@ -10,13 +10,22 @@
       1. identifica o dominio
       2. escolhe o controlador de dominio (lista os DCs encontrados)
       3. confere o LDAPS (porta 636) e o certificado do DC
-      4. descobre os grupos que parecem SETORES e pergunta quais usar
-         (e pode criar grupos de setor novos)
+      4. SETORES: cada OU de departamento ganha um grupo SO de internet
+         (NET_<DEPARTAMENTO>), com os usuarios da OU (espelhado)
       5. cria (ou reaproveita) a conta de servico SO LEITURA usada pelo pfSense
       6. testa o LDAP com essa conta - e, se quiser, com um usuario real
       7. (opcional) cria a GPO que configura o proxy nos PCs
       8. gera o arquivo squid-ad-<DOMINIO>.json para o script do pfSense
+      9. (opcional) tarefa agendada que mantem os grupos em dia a cada 15 min
 
+    No fim mostra a senha da conta de servico (quando ela foi criada/trocada)
+    para o administrador guardar no cofre de senhas.
+
+.PARAMETER Sincronizar
+    Modo sem perguntas, usado pela tarefa agendada: para cada OU de
+    departamento, cria o grupo de internet que faltar e espelha os membros
+    (usuario que mudou de OU sai do grupo antigo e entra no novo). Excecao:
+    usuario com [proxy-manual] na Descricao nunca e removido.
     Nesta versao TODOS os usuarios autenticados acessam tudo. Os setores ficam
     cadastrados para o relatorio de acessos (quem acessa o que, por setor) e
     para a restricao futura.
@@ -40,11 +49,12 @@
 [CmdletBinding()]
 param(
     [string]$OutFile,
-    [switch]$Yes
+    [switch]$Yes,
+    [switch]$Sincronizar
 )
 
 $ErrorActionPreference = 'Stop'
-$VersaoProjeto = '1.0.0'
+$VersaoProjeto = '1.1.0'
 $Aqui = Split-Path -Parent $MyInvocation.MyCommand.Definition
 # Padroes que costumam indicar grupo de SETOR (ex.: SETOR-FINANCEIRO, DEP_COMPRAS)
 $PadraoSetor = '^(SETOR|SET|DEP|DEPTO|DEPARTAMENTO|GRP|GG|GS)[-_ .]'
@@ -85,7 +95,8 @@ function Read-Valor([string]$Pergunta, [string]$Padrao, [scriptblock]$Valido = {
 function New-SenhaForte([int]$Tamanho = 32) {
     # Sem aspas, barra invertida, espaco nem $: a senha vai parar no squid.conf
     # e em linhas de comando do pfSense.
-    $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789-_.!@#%+='
+    # Sem '#': no squidGuard.conf (ldapbindpass) ele pode virar inicio de comentario.
+    $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789-_.!@%+='
     $bytes = New-Object byte[] $Tamanho
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
@@ -193,7 +204,7 @@ function ConvertTo-LdapFiltro([string]$Valor) {
 # (tests/): o que sai daqui tem que ser aceito pelo sqad_ler_pacote() do PHP.
 function New-PacoteSquid($Dom, [string]$DcHost, [string]$DcIp, [int]$Porta, [string]$Transporte,
                          [string]$ContaDn, [string]$ContaUsuario, [string]$ContaSenha,
-                         [string]$Filtro, $Setores, [string]$CaPem, $Proxy) {
+                         [string]$Filtro, $Setores, [string]$CaPem, $Proxy, $Sync = $null) {
     return [ordered]@{
         Projeto  = 'pfSense-Squid-AD'
         Versao   = $VersaoProjeto
@@ -203,9 +214,11 @@ function New-PacoteSquid($Dom, [string]$DcHost, [string]$DcIp, [int]$Porta, [str
         Conta    = [ordered]@{ Dn = $ContaDn; Usuario = $ContaUsuario; Senha = $ContaSenha }
         Filtro   = $Filtro
         Atributo = 'sAMAccountName'
-        Setores  = @($Setores | ForEach-Object { [ordered]@{ Nome = [string]$_.Name; Dn = [string]$_.DistinguishedName } })
+        Setores  = @($Setores | ForEach-Object { [ordered]@{ Nome = [string]$_.Name; Dn = [string]$_.DistinguishedName; Guid = (ConvertTo-GuidHex $_.ObjectGUID) } })
         CaPem    = $CaPem
         Proxy    = $Proxy
+        # BaseOu/Prefixo: o pfSense usa para buscar os grupos de setor sozinho (cron)
+        Sync     = $Sync
     }
 }
 
@@ -230,7 +243,97 @@ function Get-RegistrosA([string]$Nome) {
     catch { return @() }
 }
 
-# ---------------------------- pre-requisitos ---------------------------
+# Nome do setor a partir do nome da OU: sem acento, maiusculo, so A-Z 0-9 _.
+# (ex.: a OU "Expedicao Instrumental", com acentos -> EXPEDICAO_INSTRUMENTAL)
+function ConvertTo-NomeSetor([string]$Nome) {
+    $d = $Nome.Normalize([Text.NormalizationForm]::FormD)
+    $sem = -join ($d.ToCharArray() | Where-Object { [Globalization.CharUnicodeInfo]::GetUnicodeCategory($_) -ne [Globalization.UnicodeCategory]::NonSpacingMark })
+    return (($sem.ToUpperInvariant() -replace '[^A-Z0-9]+', '_').Trim('_'))
+}
+
+# GUID no MESMO formato que o pfSense le pelo LDAP (bytes crus do objectGUID em
+# hexa). Guid.ToString() usa outra ordem de bytes e quebraria a sincronizacao.
+function ConvertTo-GuidHex([guid]$Guid) {
+    return (([BitConverter]::ToString($Guid.ToByteArray())) -replace '-', '').ToLowerInvariant()
+}
+
+# Quem entra e quem sai do grupo para ele espelhar a OU. $Desejados = usuarios
+# ativos da OU; $Atuais = usuarios que sao membros diretos hoje. Usuario com
+# [proxy-manual] na Descricao e excecao: nunca e removido.
+function Get-MudancasMembros($Desejados, $Atuais) {
+    $des = @{}; foreach ($u in @($Desejados)) { if ($u) { $des[[string]$u.DistinguishedName] = $true } }
+    $atu = @{}; foreach ($u in @($Atuais))    { if ($u) { $atu[[string]$u.DistinguishedName] = $true } }
+    $add = @(@($Desejados) | Where-Object { $_ -and -not $atu.ContainsKey([string]$_.DistinguishedName) })
+    $rem = @(@($Atuais) | Where-Object { $_ -and -not $des.ContainsKey([string]$_.DistinguishedName) -and "$($_.Description)" -notmatch '\[proxy-manual\]' })
+    return [pscustomobject]@{ Adicionar = $add; Remover = $rem }
+}
+
+# Para cada OU de departamento dentro de $BaseOu: garante o grupo
+# <Prefixo><NOME DA OU> (dentro da propria OU) e espelha os membros.
+# $Interativo: pergunta antes de criar/alterar. Sem isso (tarefa agendada),
+# aplica direto e devolve o que fez em .Log.
+function Sync-SetoresAD([string]$BaseOu, [string]$Prefixo, [bool]$Interativo) {
+    $log = New-Object System.Collections.Generic.List[string]
+    $grupos = New-Object System.Collections.Generic.List[object]
+    $ous = @(Get-ADOrganizationalUnit -SearchBase $BaseOu -SearchScope OneLevel -Filter * | Sort-Object Name)
+    foreach ($ou in $ous) {
+        $nome = $Prefixo + (ConvertTo-NomeSetor $ou.Name)
+        $usuarios = @(Get-ADUser -SearchBase $ou.DistinguishedName -SearchScope Subtree -Filter 'Enabled -eq $true' -Properties Description)
+        $g = Get-ADGroup -Filter "Name -eq '$nome'" -ErrorAction SilentlyContinue
+        if (-not $g) {
+            if ($Interativo -and -not (Read-SimNao ("Criar o grupo '{0}' na OU '{1}' ({2} usuario(s) nela)?" -f $nome, $ou.Name, $usuarios.Count) $true)) { continue }
+            $g = New-ADGroup -Name $nome -SamAccountName $nome -GroupCategory Security -GroupScope Global -Path $ou.DistinguishedName `
+                -Description ("Internet (proxy) - setor {0} - pfSense-Squid-AD" -f $ou.Name) -PassThru
+            $log.Add("grupo criado: $nome (OU $($ou.Name))")
+            if ($Interativo) { Ok "grupo criado: $nome" }
+        } elseif ($Interativo) { Ok "grupo '$nome' ja existe - usando" }
+        $atuais = @(Get-ADGroupMember -Identity $g | Where-Object { $_.objectClass -eq 'user' } |
+            ForEach-Object { Get-ADUser -Identity $_.distinguishedName -Properties Description })
+        $m = Get-MudancasMembros $usuarios $atuais
+        if ($m.Adicionar.Count -or $m.Remover.Count) {
+            $resumo = "{0}: +{1} / -{2}" -f $nome, $m.Adicionar.Count, $m.Remover.Count
+            $pergunta = "Espelhar a OU no grupo '$nome'? (entra(m) $($m.Adicionar.Count), sai(em) $($m.Remover.Count))"
+            if (-not $Interativo -or (Read-SimNao $pergunta $true)) {
+                if ($m.Adicionar.Count) { Add-ADGroupMember -Identity $g -Members $m.Adicionar }
+                if ($m.Remover.Count)   { Remove-ADGroupMember -Identity $g -Members $m.Remover -Confirm:$false }
+                $sairam = if ($m.Remover.Count) { ' (sairam: ' + (($m.Remover | ForEach-Object { $_.SamAccountName }) -join ', ') + ')' } else { '' }
+                $log.Add("membros $resumo$sairam")
+                if ($Interativo) { Ok "membros atualizados ($resumo)" }
+            }
+        }
+        $grupos.Add((Get-ADGroup -Identity $g -Properties ObjectGUID))
+    }
+    # .ToArray(): @() de List<T> dentro de [pscustomobject]@{} dispara 'Argument types do not match'
+    return [pscustomobject]@{ Grupos = $grupos.ToArray(); Log = $log.ToArray() }
+}
+
+if ($Sincronizar) {
+    # Tarefa agendada (SYSTEM, sem perguntas). Le a configuracao gravada pelo
+    # modo interativo e registra o resultado em log + Log de Aplicativo.
+    $cfgSync = Join-Path $Aqui 'sincronizacao.json'
+    $logSync = Join-Path $Aqui 'sincronizacao.log'
+    $fonte = 'pfSense-Squid-AD'
+    function Write-LogSync([string]$m) {
+        if ((Test-Path $logSync) -and (Get-Item $logSync).Length -gt 2MB) { Move-Item $logSync "$logSync.old" -Force }
+        Add-Content -Path $logSync -Value ("{0}  {1}" -f (Get-Date).ToString('s'), $m)
+    }
+    try {
+        if (-not [Diagnostics.EventLog]::SourceExists($fonte)) { New-EventLog -LogName Application -Source $fonte }
+        Import-Module ActiveDirectory -ErrorAction Stop
+        $c = Get-Content $cfgSync -Raw | ConvertFrom-Json
+        $r = Sync-SetoresAD $c.BaseOu $c.Prefixo $false
+        if ($r.Log.Count) {
+            foreach ($l in $r.Log) { Write-LogSync $l }
+            Write-EventLog -LogName Application -Source $fonte -EventId 2000 -EntryType Information -Message ("Setores sincronizados:`n" + ($r.Log -join "`n"))
+        }
+        exit 0
+    } catch {
+        Write-LogSync "ERRO: $($_.Exception.Message)"
+        try { Write-EventLog -LogName Application -Source $fonte -EventId 2001 -EntryType Error -Message "Sincronizacao dos setores FALHOU: $($_.Exception.Message)" } catch {}
+        exit 1
+    }
+}
+
 Write-Host ''
 Write-Host "  pfSense-Squid-AD $VersaoProjeto - preparar o AD para o login do Squid" -ForegroundColor White
 Write-Host '  -----------------------------------------------------------------'
@@ -335,12 +438,43 @@ if ($ldaps) {
 }
 
 # ------------------------------ 4. setores -----------------------------
-Step 'Setores (grupos do AD)'
-Info 'Cada setor e um grupo do AD. Nesta versao TODOS acessam tudo: os setores'
-Info 'servem para o relatorio (quem acessa o que, por setor) e para restringir depois.'
-Info 'Quem nao estiver em nenhum setor tambem acessa tudo, e aparece no relatorio'
-Info 'como "SEM SETOR".'
+Step 'Setores (grupos de internet)'
+Info 'Cada setor vira um grupo SO de internet (ex.: NET_FINANCEIRO), separado dos'
+Info 'grupos de pastas (GR_/GRE_). Nesta versao TODOS acessam tudo: no pfSense cada'
+Info 'setor vira uma regra no SquidGuard que libera tudo, pronta para restringir depois.'
+Info 'Quem nao estiver em nenhum setor tambem acessa tudo e aparece como "SEM SETOR".'
 $setores = New-Object System.Collections.Generic.List[object]
+$sync = $null
+$topo = @(Get-ADOrganizationalUnit -SearchBase $dom.DistinguishedName -SearchScope OneLevel -Filter * |
+    Where-Object { $_.Name -ne 'Domain Controllers' } | Sort-Object Name)
+if ($topo.Count) {
+    $maisFilhas = 0; $padraoOu = 1
+    for ($i = 0; $i -lt $topo.Count; $i++) {
+        $f = @(Get-ADOrganizationalUnit -SearchBase $topo[$i].DistinguishedName -SearchScope OneLevel -Filter *).Count
+        if ($f -gt $maisFilhas) { $maisFilhas = $f; $padraoOu = $i + 1 }
+        Info ("{0}. {1}  ({2} OU(s) dentro)" -f ($i + 1), $topo[$i].Name, $f)
+    }
+    $nOu = Read-Valor 'OU da empresa (onde ficam as OUs de departamento)' "$padraoOu" { param($v) $v -match '^\d+$' -and [int]$v -ge 1 -and [int]$v -le $topo.Count } "digite um numero de 1 a $($topo.Count)."
+    $empresa = $topo[[int]$nOu - 1]
+    $deps = @(Get-ADOrganizationalUnit -SearchBase $empresa.DistinguishedName -SearchScope OneLevel -Filter * | Sort-Object Name)
+    Info ("departamentos em '{0}': {1}" -f $empresa.Name, (($deps | ForEach-Object { $_.Name }) -join ', '))
+    if ($deps.Count -and (Read-SimNao "Cada OU dentro de '$($empresa.Name)' e um departamento (setor)?" $true)) {
+        $prefixo = Read-Valor 'Prefixo dos grupos de internet' 'NET_' { param($v) $v -match '^[A-Za-z][A-Za-z0-9_-]{0,9}$' } 'use ate 10 caracteres: letras, numeros, _ ou -, comecando com letra.'
+        Info 'Para cada departamento: o grupo fica DENTRO da OU dele e recebe os usuarios ativos'
+        Info 'que estao nela (espelhado). Usuario com [proxy-manual] na Descricao nunca e tirado.'
+        $r = Sync-SetoresAD $empresa.DistinguishedName $prefixo $true
+        foreach ($g in $r.Grupos) { $setores.Add($g) }
+        $sync = [ordered]@{ BaseOu = [string]$empresa.DistinguishedName; Prefixo = $prefixo }
+        $soltos = @(Get-ADUser -SearchBase $empresa.DistinguishedName -SearchScope OneLevel -Filter 'Enabled -eq $true')
+        if ($soltos.Count) {
+            Warn ("{0} usuario(s) direto em '{1}', fora dos departamentos: ficam SEM SETOR (acessam" -f $soltos.Count, $empresa.Name)
+            Info ('    tudo e aparecem destacados no relatorio). Mova para a OU do departamento: ' + ((($soltos | Select-Object -First 12) | ForEach-Object { $_.Name }) -join ', ') + $(if ($soltos.Count -gt 12) { ', ...' } else { '' }))
+        }
+    }
+}
+if (-not $sync) {
+Info 'Sem OUs de departamento: escolha grupos que ja existem no AD para servir de setor.'
+
 $todosGrupos = @(Get-ADGroup -Filter 'GroupCategory -eq "Security"' -Properties Description, Members |
     Where-Object { $_.DistinguishedName -notlike '*,CN=Builtin,*' -and $_.SID.Value -match '-\d{4,}$' } | Sort-Object Name)
 $candidatos = @($todosGrupos | Where-Object { $_.Name -match $PadraoSetor -or $_.Description -match 'setor|departamento' })
@@ -358,27 +492,6 @@ if ($outros.Count -gt 0 -and (Read-SimNao "Ver os outros $($outros.Count) grupo(
         if (Read-SimNao ("Usar '{0}' ({1} membro(s))?" -f $g.Name, @($g.Members).Count) $false) { $setores.Add($g) }
     }
 }
-if (Read-SimNao 'Criar grupos de setor novos?' $false) {
-    $ouPadrao = "OU=Setores,$($dom.DistinguishedName)"
-    $ou = Read-Valor 'Em qual OU criar os grupos' $ouPadrao
-    if (-not (Get-ADOrganizationalUnit -Filter "DistinguishedName -eq '$ou'" -ErrorAction SilentlyContinue)) {
-        if (Read-SimNao "A OU '$ou' nao existe. Criar?" $true) {
-            $partes = $ou -split ',', 2
-            New-ADOrganizationalUnit -Name ($partes[0] -replace '^OU=', '') -Path $partes[1] -ProtectedFromAccidentalDeletion $true
-            Ok "OU criada: $ou"
-        } else { throw 'Cancelado: OU dos grupos nao existe.' }
-    }
-    $nomes = Read-Valor 'Nomes dos grupos, separados por virgula' 'SETOR-FINANCEIRO, SETOR-COMPRAS, SETOR-CONTABILIDADE' { param($v) $v -match '\S' }
-    foreach ($nome in ($nomes -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
-        $existe = Get-ADGroup -Filter "Name -eq '$nome'" -ErrorAction SilentlyContinue
-        if ($existe) { Ok "'$nome' ja existe - usando"; $setores.Add($existe); continue }
-        if (Read-SimNao "Criar o grupo '$nome'?" $true) {
-            $g = New-ADGroup -Name $nome -SamAccountName $nome -GroupCategory Security -GroupScope Global -Path $ou `
-                -Description 'Setor - acesso a internet pelo proxy (pfSense-Squid-AD)' -PassThru
-            Ok "grupo criado: $nome  (coloque os usuarios do setor nele)"
-            $setores.Add($g)
-        }
-    }
 }
 $setores = @($setores | Sort-Object DistinguishedName -Unique)
 if ($setores.Count -eq 0) { Warn 'nenhum setor escolhido: todos aparecem como "SEM SETOR" no relatorio (e acessam tudo).' }
@@ -395,6 +508,7 @@ if ($svc) {
     Ok "a conta '$svcNome' ja existe: $($svc.DistinguishedName)"
     if (Read-SimNao 'Gerar uma senha nova para ela? (o pfSense recebe a nova pelo arquivo)' $true) {
         $svcSenha = New-SenhaForte
+        $senhaParaMostrar = $svcSenha
         Set-ADAccountPassword -Identity $svc -Reset -NewPassword (ConvertTo-SecureString $svcSenha -AsPlainText -Force)
         Ok 'senha nova gerada e aplicada.'
     } else {
@@ -407,6 +521,7 @@ if ($svc) {
     Info 'e que o usuario nao pode trocar (senao o pfSense para de conseguir logar).'
     if (-not (Read-SimNao "Criar a conta '$svcNome'?" $true)) { throw 'Cancelado: a conta de servico e obrigatoria.' }
     $svcSenha = New-SenhaForte
+    $senhaParaMostrar = $svcSenha
     New-ADUser -Name $svcNome -SamAccountName $svcNome -UserPrincipalName "$svcNome@$($dom.DNSRoot)" -Path $cont `
         -AccountPassword (ConvertTo-SecureString $svcSenha -AsPlainText -Force) -Enabled $true `
         -PasswordNeverExpires $true -CannotChangePassword $true `
@@ -506,7 +621,7 @@ Info 'servico, setores e a CA do LDAPS.'
 $incluiSenha = Read-SimNao 'Incluir a senha da conta de servico no arquivo? (senao o pfSense pergunta)' $true
 $dados = New-PacoteSquid -Dom $dom -DcHost $dcHost -DcIp $dcIp -Porta $porta -Transporte $transporte `
     -ContaDn $svc.DistinguishedName -ContaUsuario $svcNome -ContaSenha $(if ($incluiSenha) { $svcSenha } else { '' }) `
-    -Filtro $filtro -Setores $setores -CaPem $caPem -Proxy $proxy
+    -Filtro $filtro -Setores $setores -CaPem $caPem -Proxy $proxy -Sync $sync
 ($dados | ConvertTo-Json -Depth 5) | Set-Content -Path $OutFile -Encoding ASCII
 # So Administradores e SYSTEM leem o arquivo (ele pode ter a senha da conta).
 & icacls.exe $OutFile /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' /Q | Out-Null
@@ -514,9 +629,49 @@ Ok "gravado: $OutFile"
 if ($incluiSenha) { Warn 'o arquivo tem a senha da conta de servico: apague-o depois de usar no pfSense.' }
 $svcSenha = $null
 
+# --------------------- 9. sincronizacao automatica ----------------------
+if ($sync) {
+    Step 'Sincronizacao automatica no AD (opcional)'
+    Info 'Uma tarefa agendada (a cada 15 min, como SYSTEM) mantem os setores em dia:'
+    Info '  OU de departamento nova  -> cria o grupo de internet dela'
+    Info '  usuario novo/movido      -> entra no grupo do departamento e sai do antigo'
+    Info 'O pfSense, por sua vez, traz os grupos novos para o SquidGuard sozinho.'
+    if (Read-SimNao 'Criar a tarefa agendada de sincronizacao (a cada 15 min)?' $true) {
+        $dirSync = Join-Path $env:ProgramData 'pfSense-Squid-AD'
+        if (-not (Test-Path $dirSync)) { New-Item -ItemType Directory -Force $dirSync | Out-Null }
+        # Trava so a pasta (SYSTEM + Administradores); o conteudo herda dela.
+        & icacls.exe $dirSync /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C /Q | Out-Null
+        Copy-Item $MyInvocation.MyCommand.Definition (Join-Path $dirSync 'Install-SquidAD.ps1') -Force
+        ($sync | ConvertTo-Json) | Set-Content -Path (Join-Path $dirSync 'sincronizacao.json') -Encoding ASCII
+        & icacls.exe (Join-Path $dirSync '*') /reset /T /C /Q | Out-Null
+        $tarefa = 'pfSense-Squid-AD - Sincronizar setores'
+        $acao = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $dirSync 'Install-SquidAD.ps1') + '" -Sincronizar'
+        & schtasks.exe /Create /F /TN $tarefa /RU SYSTEM /RL HIGHEST /SC MINUTE /MO 15 /TR $acao | Out-Null
+        if ($LASTEXITCODE -ne 0) { Warn "nao consegui criar a tarefa (schtasks exit $LASTEXITCODE)." }
+        else {
+            Ok "tarefa '$tarefa' criada (a cada 15 min)"
+            Info "log: $(Join-Path $dirSync 'sincronizacao.log')  |  eventos 2000 (ok) / 2001 (erro), origem pfSense-Squid-AD"
+        }
+    }
+}
+
 Write-Host ''
 Write-Host 'Pronto no AD. Proximo passo, no pfSense (docs/pfsense.md):' -ForegroundColor Cyan
 Write-Host '    1. Diagnostics > Command Prompt > Upload File: envie o squid-ad.php e o .json'
 Write-Host '    2. Por SSH (recomendado, interativo):'
 Write-Host "         php /tmp/squid-ad.php aplicar /tmp/$(Split-Path $OutFile -Leaf)"
 Write-Host '       ou na tela Command Prompt (sem perguntas): primeiro "simular", depois "aplicar ... --sim"'
+
+# --------------------------- senha gerada --------------------------------
+# Por ultimo, para ser a ultima coisa na tela.
+if ($senhaParaMostrar) {
+    Write-Host ''
+    Write-Host '  =====================================================================' -ForegroundColor Yellow
+    Write-Host "   SENHA DA CONTA DE SERVICO '$svcNome' - GUARDE NO COFRE DE SENHAS" -ForegroundColor Yellow
+    Write-Host '  =====================================================================' -ForegroundColor Yellow
+    Write-Host "      $senhaParaMostrar" -ForegroundColor White
+    Write-Host '   Ela foi gerada agora e NAO fica gravada em log. Voce vai precisar dela'
+    Write-Host '   se reinstalar o pfSense sem o arquivo .json, ou para conferir a conta.'
+    Write-Host '  =====================================================================' -ForegroundColor Yellow
+    $senhaParaMostrar = $null
+}

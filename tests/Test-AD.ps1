@@ -137,20 +137,120 @@ Cenario 'so APIPA -> lista vazia (o script pede o IP)' {
     'ok'
 }
 
-[Console]::WriteLine('7) Arquivo para o pfSense (contrato com o squid-ad.php)')
+[Console]::WriteLine('7) Setores por OU (v1.1)')
+$acento = "Expedi$([char]0xE7)$([char]0xE3)o Instrumental"   # "Expedicao Instrumental" com cedilha e til
+Cenario 'nome do setor: sem acento, maiusculo, so A-Z 0-9 _' {
+    if ((ConvertTo-NomeSetor $acento) -ne 'EXPEDICAO_INSTRUMENTAL') { throw "resultado: $(ConvertTo-NomeSetor $acento)" }
+    if ((ConvertTo-NomeSetor ' Suporte  Terceirizado ') -ne 'SUPORTE_TERCEIRIZADO') { throw 'espacos' }
+    if ((ConvertTo-NomeSetor "Licita$([char]0xE7)$([char]0xE3)o") -ne 'LICITACAO') { throw 'licitacao' }
+    'ok'
+}
+Cenario 'GUID no formato do objectGUID cru (o que o pfSense le pelo LDAP)' {
+    $h = ConvertTo-GuidHex ([guid]'01234567-89ab-cdef-0123-456789abcdef')
+    if ($h -ne '67452301ab89efcd0123456789abcdef') { throw "resultado: $h (a ordem dos bytes tem que ser a do AD)" }
+    'ok'
+}
+Cenario 'espelhamento: entra quem esta na OU, sai quem saiu, [proxy-manual] fica' {
+    $u = { param($dn, $d = '') [pscustomobject]@{ DistinguishedName = $dn; Description = $d; SamAccountName = ($dn -split ',')[0].Substring(3) } }
+    $des = @((& $u 'CN=ana,OU=Fin'), (& $u 'CN=bia,OU=Fin'))
+    $atu = @((& $u 'CN=bia,OU=Fin'), (& $u 'CN=caio,OU=Com'), (& $u 'CN=dani,OU=Dir' 'gerente [proxy-manual]'))
+    $m = Get-MudancasMembros $des $atu
+    if ((($m.Adicionar | ForEach-Object SamAccountName) -join ',') -ne 'ana') { throw "adicionar: $(($m.Adicionar | ForEach-Object SamAccountName) -join ',')" }
+    if ((($m.Remover | ForEach-Object SamAccountName) -join ',') -ne 'caio') { throw "remover: $(($m.Remover | ForEach-Object SamAccountName) -join ',')" }
+    $v = Get-MudancasMembros @() @()
+    if ($v.Adicionar.Count -or $v.Remover.Count) { throw 'vazio' }
+    'ok'
+}
+
+# ---- AD simulado em memoria para o Sync-SetoresAD ----
+$script:AD = @{ OUs = New-Object System.Collections.ArrayList; Users = New-Object System.Collections.ArrayList; Groups = New-Object System.Collections.ArrayList }
+function Novo-OU($dn) { [void]$script:AD.OUs.Add([pscustomobject]@{ Name = ($dn -split ',')[0].Substring(3); DistinguishedName = $dn }) }
+function Novo-User($nome, $ou, $ativo = $true, $desc = '') { [void]$script:AD.Users.Add([pscustomobject]@{ Name = $nome; SamAccountName = $nome; DistinguishedName = "CN=$nome,$ou"; Enabled = $ativo; Description = $desc }) }
+# Como no AD real: ao mover o usuario, a referencia nos grupos acompanha o novo DN.
+function Mover-User($nome, $ou) {
+    $u = $script:AD.Users | Where-Object SamAccountName -eq $nome
+    $antigo = $u.DistinguishedName; $u.DistinguishedName = "CN=$nome,$ou"
+    foreach ($g in $script:AD.Groups) { $i = $g.Members.IndexOf($antigo); if ($i -ge 0) { $g.Members[$i] = $u.DistinguishedName } }
+}
+function Pai($dn) { ($dn -split ',', 2)[1] }
+function Get-ADOrganizationalUnit { param($SearchBase, $SearchScope, $Filter)
+    @($script:AD.OUs | Where-Object { (Pai $_.DistinguishedName) -eq $SearchBase }) }
+function Get-ADUser { param($SearchBase, $SearchScope, $Filter, $Properties, $Identity)
+    if ($Identity) { return $script:AD.Users | Where-Object { $_.DistinguishedName -eq $Identity } }
+    @($script:AD.Users | Where-Object { $_.Enabled -and $(if ($SearchScope -eq 'OneLevel') { (Pai $_.DistinguishedName) -eq $SearchBase } else { $_.DistinguishedName -like "*,$SearchBase" }) }) }
+function Get-ADGroup { param($Filter, $Identity, $Properties, $ErrorAction)
+    if ($Identity) { $dn = if ($Identity -is [string]) { $Identity } else { $Identity.DistinguishedName }; return $script:AD.Groups | Where-Object DistinguishedName -eq $dn }
+    $n = [regex]::Match($Filter, "Name -eq '([^']+)'").Groups[1].Value
+    $script:AD.Groups | Where-Object Name -eq $n }
+function New-ADGroup { param($Name, $SamAccountName, $GroupCategory, $GroupScope, $Path, $Description, [switch]$PassThru)
+    $g = [pscustomobject]@{ Name = $Name; DistinguishedName = "CN=$Name,$Path"; ObjectGUID = [guid]::NewGuid(); Members = (New-Object System.Collections.ArrayList) }
+    [void]$script:AD.Groups.Add($g); $g }
+function Get-ADGroupMember { param($Identity)
+    @($Identity.Members | ForEach-Object { $dn = $_; [pscustomobject]@{ distinguishedName = $dn; objectClass = 'user' } }) }
+function Add-ADGroupMember { param($Identity, $Members) foreach ($m in $Members) { [void]$Identity.Members.Add($m.DistinguishedName) } }
+function Remove-ADGroupMember { param($Identity, $Members, $Confirm) foreach ($m in $Members) { $Identity.Members.Remove($m.DistinguishedName) } }
+function Ok { param($m) }
+$base = 'OU=AGF,DC=teste,DC=local'
+Novo-OU "OU=Financeiro,$base"; Novo-OU "OU=Comercial,$base"; Novo-OU "OU=$acento,$base"
+Novo-User 'ana' "OU=Financeiro,$base"; Novo-User 'bia' "OU=Financeiro,$base"; Novo-User 'caio' "OU=Comercial,$base"
+Novo-User 'inativo' "OU=Comercial,$base" $false; Novo-User 'solto' $base
+
+Cenario 'cria um grupo por OU, dentro da OU, com os usuarios ativos dela' {
+    $r = Sync-SetoresAD $base 'NET_' $false
+    $nomes = ($r.Grupos | ForEach-Object Name | Sort-Object) -join ','
+    if ($nomes -ne 'NET_COMERCIAL,NET_EXPEDICAO_INSTRUMENTAL,NET_FINANCEIRO') { throw "grupos: $nomes" }
+    $fin = $script:AD.Groups | Where-Object Name -eq 'NET_FINANCEIRO'
+    if ($fin.DistinguishedName -ne "CN=NET_FINANCEIRO,OU=Financeiro,$base") { throw "lugar: $($fin.DistinguishedName)" }
+    if (($fin.Members | Sort-Object) -join ';' -ne "CN=ana,OU=Financeiro,$base;CN=bia,OU=Financeiro,$base") { throw "membros: $($fin.Members -join ';')" }
+    $com = $script:AD.Groups | Where-Object Name -eq 'NET_COMERCIAL'
+    if ($com.Members.Count -ne 1) { throw 'inativo entrou no grupo' }
+    "($($r.Log.Count) acao(oes))"
+}
+Cenario 'rodar de novo sem mudancas nao faz nada' {
+    $r = Sync-SetoresAD $base 'NET_' $false
+    if ($r.Log.Count) { throw "fez: $($r.Log -join ' | ')" }
+    'ok'
+}
+Cenario 'usuario mudou de departamento: sai do grupo antigo, entra no novo' {
+    Mover-User 'bia' "OU=Comercial,$base"
+    $r = Sync-SetoresAD $base 'NET_' $false
+    $fin = $script:AD.Groups | Where-Object Name -eq 'NET_FINANCEIRO'; $com = $script:AD.Groups | Where-Object Name -eq 'NET_COMERCIAL'
+    if ($fin.Members -contains "CN=bia,OU=Comercial,$base" -or $fin.Members.Count -ne 1) { throw "financeiro: $($fin.Members -join ';')" }
+    if (-not ($com.Members -contains "CN=bia,OU=Comercial,$base")) { throw 'nao entrou no comercial' }
+    "($($r.Log -join ' | '))"
+}
+Cenario 'excecao manual: usuario de fora com [proxy-manual] nao e tirado' {
+    Novo-User 'diretor' "OU=Diretoria,$base" $true 'Diretor [proxy-manual]'
+    $fin = $script:AD.Groups | Where-Object Name -eq 'NET_FINANCEIRO'
+    [void]$fin.Members.Add("CN=diretor,OU=Diretoria,$base")
+    $r = Sync-SetoresAD $base 'NET_' $false
+    if (-not ($fin.Members -contains "CN=diretor,OU=Diretoria,$base")) { throw 'tirou a excecao' }
+    'ok'
+}
+Cenario 'OU nova de departamento ganha o grupo sozinha' {
+    Novo-OU "OU=Qualidade,$base"; Novo-User 'quel' "OU=Qualidade,$base"
+    $r = Sync-SetoresAD $base 'NET_' $false
+    $q = $script:AD.Groups | Where-Object Name -eq 'NET_QUALIDADE'
+    if (-not $q -or $q.Members.Count -ne 1) { throw 'grupo da OU nova' }
+    "($($r.Log -join ' | '))"
+}
+$script:SetoresTeste = @($script:AD.Groups)
+
+[Console]::WriteLine('8) Arquivo para o pfSense (contrato com o squid-ad.php)')
 Cenario 'New-PacoteSquid gera o JSON que o PHP le' {
     $dom = [pscustomobject]@{ DNSRoot = 'teste.local'; NetBIOSName = 'TESTE'; DistinguishedName = 'DC=teste,DC=local' }
-    $setores = @([pscustomobject]@{ Name = 'SETOR-FINANCEIRO'; DistinguishedName = 'CN=SETOR-FINANCEIRO,OU=Setores,DC=teste,DC=local' },
-                 [pscustomobject]@{ Name = 'SETOR-COMPRAS';    DistinguishedName = 'CN=SETOR-COMPRAS,OU=Setores,DC=teste,DC=local' })
+    $setores = @($script:SetoresTeste | Sort-Object Name)   # os grupos criados pelo Sync-SetoresAD acima
     $i = Get-LdapsInfo 'dc.teste.local' $PortaTls '127.0.0.1'
     $d = New-PacoteSquid -Dom $dom -DcHost 'localhost' -DcIp '127.0.0.1' -Porta 636 -Transporte 'ssl' `
         -ContaDn 'CN=svc-squid-ldap,CN=Users,DC=teste,DC=local' -ContaUsuario 'svc-squid-ldap' -ContaSenha 'Aa1!senha-da-conta' `
         -Filtro '(&(objectCategory=person)(objectClass=user)(sAMAccountName=%s)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' `
-        -Setores $setores -CaPem (ConvertTo-Pem $i.Raiz.RawData) -Proxy $null
+        -Setores $setores -CaPem (ConvertTo-Pem $i.Raiz.RawData) -Proxy $null -Sync ([ordered]@{ BaseOu = 'OU=AGF,DC=teste,DC=local'; Prefixo = 'NET_' })
     $arq = Join-Path $WorkDir 'pacote.json'
     ($d | ConvertTo-Json -Depth 5) | Set-Content -Path $arq -Encoding ASCII
     $volta = Get-Content $arq -Raw | ConvertFrom-Json
-    if ($volta.Setores.Count -ne 2 -or $volta.Servidor.Porta -ne 636) { throw 'estrutura errada' }
+    if ($volta.Setores.Count -ne 4 -or $volta.Servidor.Porta -ne 636) { throw "estrutura errada ($($volta.Setores.Count) setores)" }
+    if (@($volta.Setores | Where-Object { $_.Guid -notmatch '^[0-9a-f]{32}$' }).Count) { throw 'setor sem Guid' }
+    if ($volta.Sync.Prefixo -ne 'NET_') { throw 'Sync' }
     "($arq)"
 }
 
