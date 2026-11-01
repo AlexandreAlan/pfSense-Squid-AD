@@ -215,9 +215,11 @@ function Sort-IpsPreferidos([string[]]$Ips, [string[]]$Preferidos) {
     return @(@($Ips | Where-Object { $Preferidos -contains $_ }) + @($Ips | Where-Object { $Preferidos -notcontains $_ }))
 }
 
-# Registros A de um nome no DNS (vazio se nao resolver).
+# Registros A de um nome NO SERVIDOR DNS (vazio se nao resolver). -DnsOnly e
+# -NoHostsFile: consulta o DNS de verdade, sem o arquivo hosts e sem a resolucao
+# local do Windows (que no proprio DC devolve os IPs de TODAS as placas).
 function Get-RegistrosA([string]$Nome) {
-    try { return @(Resolve-DnsName -Name $Nome -Type A -ErrorAction Stop | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress }) }
+    try { return @(Resolve-DnsName -Name $Nome -Type A -DnsOnly -NoHostsFile -ErrorAction Stop | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress }) }
     catch { return @() }
 }
 
@@ -264,9 +266,12 @@ for ($i = 0; $i -lt $dcs.Count; $i++) {
     if ($d -eq $esteDc) {
         $todos += @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { $_.IPAddress })
     }
-    $apipa = @($todos | Where-Object { $_ -like '169.254.*' } | Select-Object -Unique)
     $ipsDc[$d.HostName] = @(Sort-IpsPreferidos (Select-IPv4Util $todos) $ipsGateway)
-    $noDns = @(Select-IPv4Util (Get-RegistrosA $d.HostName))
+    $dnsBruto = @(Get-RegistrosA $d.HostName)
+    $noDns = @(Select-IPv4Util $dnsBruto)
+    # So reclama do 169.254 se ele estiver REGISTRADO no DNS. Em placa local
+    # (ex.: VPN ainda sem IP) ele so e ignorado.
+    $apipa = @($dnsBruto | Where-Object { $_ -like '169.254.*' } | Select-Object -Unique)
     $marca = if ($d -eq $esteDc) { '  (este servidor)' } else { '' }
     $mostra = if ($ipsDc[$d.HostName].Count) { $ipsDc[$d.HostName] -join ', ' } else { 'sem IP utilizavel' }
     Info ("{0}. {1}  -  {2}  (site do AD: {3}){4}" -f ($i + 1), $d.HostName, $mostra, $d.Site, $marca)
