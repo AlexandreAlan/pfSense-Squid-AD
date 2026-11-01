@@ -208,6 +208,13 @@ function Select-IPv4Util([string[]]$Ips) {
     return @($Ips | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and $_ -notlike '169.254.*' -and $_ -notlike '127.*' } | Select-Object -Unique)
 }
 
+# Ordena os IPs deixando primeiro os "preferidos" (os da placa com gateway, que
+# e a que fala com o pfSense). Sem preferidos, mantem a ordem.
+function Sort-IpsPreferidos([string[]]$Ips, [string[]]$Preferidos) {
+    $Ips = @($Ips); $Preferidos = @($Preferidos)
+    return @(@($Ips | Where-Object { $Preferidos -contains $_ }) + @($Ips | Where-Object { $Preferidos -notcontains $_ }))
+}
+
 # Registros A de um nome no DNS (vazio se nao resolver).
 function Get-RegistrosA([string]$Nome) {
     try { return @(Resolve-DnsName -Name $Nome -Type A -ErrorAction Stop | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress }) }
@@ -246,6 +253,9 @@ $dcs = @(Get-ADDomainController -Filter * | Sort-Object HostName)
 $esteDc = $dcs | Where-Object { $_.Name -ieq $env:COMPUTERNAME } | Select-Object -First 1
 $padraoDc = if ($esteDc) { [array]::IndexOf($dcs, $esteDc) + 1 } else { 1 }
 $ipsDc = @{}
+# IPs das placas deste servidor que tem gateway (a LAN): sao os preferidos.
+$ipsGateway = @(Get-NetIPConfiguration -ErrorAction SilentlyContinue | Where-Object { $_.IPv4DefaultGateway } |
+    ForEach-Object { $_.IPv4Address.IPAddress })
 for ($i = 0; $i -lt $dcs.Count; $i++) {
     $d = $dcs[$i]
     # Todos os IPs do DC: o que o AD informa + os registros A no DNS (+ as placas
@@ -255,7 +265,8 @@ for ($i = 0; $i -lt $dcs.Count; $i++) {
         $todos += @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { $_.IPAddress })
     }
     $apipa = @($todos | Where-Object { $_ -like '169.254.*' } | Select-Object -Unique)
-    $ipsDc[$d.HostName] = @(Select-IPv4Util $todos)
+    $ipsDc[$d.HostName] = @(Sort-IpsPreferidos (Select-IPv4Util $todos) $ipsGateway)
+    $noDns = @(Select-IPv4Util (Get-RegistrosA $d.HostName))
     $marca = if ($d -eq $esteDc) { '  (este servidor)' } else { '' }
     $mostra = if ($ipsDc[$d.HostName].Count) { $ipsDc[$d.HostName] -join ', ' } else { 'sem IP utilizavel' }
     Info ("{0}. {1}  -  {2}  (site do AD: {3}){4}" -f ($i + 1), $d.HostName, $mostra, $d.Site, $marca)
@@ -264,6 +275,10 @@ for ($i = 0; $i -lt $dcs.Count; $i++) {
         Info '    PCs e o pfSense podem tentar esse IP e falhar. Corrija no DC: desative a placa sem uso, ou'
         Info '    nas propriedades dela > IPv4 > Avancado > DNS, desmarque "Registrar os enderecos desta conexao no DNS".'
         Info '    Depois: ipconfig /registerdns e apague o registro 169.254 no Gerenciador de DNS.'
+    }
+    if ($noDns.Count -gt 1) {
+        Warn ("{0} tem {1} IPs no DNS do AD ({2}). Normalmente e placa de VPN registrando o IP dela" -f $d.Name, $noDns.Count, ($noDns -join ', '))
+        Info '    (ex.: Pritunl/OpenVPN). Um DC deve registrar so o IP da LAN: desmarque o registro no DNS nas outras placas.'
     }
 }
 $escolha = Read-Valor 'Controlador (numero ou nome)' "$padraoDc" {

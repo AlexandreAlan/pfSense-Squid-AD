@@ -117,6 +117,12 @@ Cenario 'APIPA, loopback e repetidos ficam de fora' {
     if (($r -join ',') -ne '172.16.10.5,10.0.0.2') { throw "resultado: $($r -join ',')" }
     'ok'
 }
+Cenario 'o IP da placa com gateway vem primeiro (LAN antes da VPN)' {
+    $r = @(Sort-IpsPreferidos @('10.10.120.23', '172.16.10.7') @('172.16.10.7'))
+    if (($r -join ',') -ne '172.16.10.7,10.10.120.23') { throw "resultado: $($r -join ',')" }
+    if ((@(Sort-IpsPreferidos @('10.0.0.1', '10.0.0.2') @()) -join ',') -ne '10.0.0.1,10.0.0.2') { throw 'sem preferidos mudou a ordem' }
+    'ok'
+}
 Cenario 'so APIPA -> lista vazia (o script pede o IP)' {
     if (@(Select-IPv4Util @('169.254.1.1')).Count -ne 0) { throw 'deveria ser vazia' }
     'ok'
