@@ -1,4 +1,10 @@
-# pfSense-Squid-AD
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/pfsense/white">
+    <img src="https://cdn.simpleicons.org/pfsense/212121" alt="pfSense" height="36" align="absmiddle">
+  </picture>
+  pfSense-Squid-AD
+</h1>
 
 [![Testes](https://github.com/AlexandreAlan/pfSense-Squid-AD/actions/workflows/testes.yml/badge.svg)](https://github.com/AlexandreAlan/pfSense-Squid-AD/actions/workflows/testes.yml)
 ![pfSense CE 2.7](https://img.shields.io/badge/pfSense_CE-2.7-212121)
