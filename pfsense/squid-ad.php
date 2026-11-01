@@ -13,6 +13,15 @@
  *   php squid-ad.php status
  *   php squid-ad.php desfazer  [--sim]                volta tudo como estava antes do projeto
  *
+ * Inspecao SSL (fase 2, docs/roadmap.md): bump so no necessario, splice por padrao.
+ *   php squid-ad.php ssl-simular                      mostra o que a inspecao SSL vai mudar, NAO muda nada
+ *   php squid-ad.php ssl-aplicar [--sim]               cria a CA, liga o SSL bump (splice por padrao)
+ *   php squid-ad.php ssl-testar  <usuario>             testa os sites criticos (banco, gov.br...) pelo proxy
+ *   php squid-ad.php ssl-status
+ *   php squid-ad.php ssl-desfazer [--sim]              desliga a inspecao SSL, volta como estava
+ * ssl-aplicar e ssl-desfazer (fora de --sim) pedem a frase digitada "CONFIRMO INSPECAO SSL" antes de
+ * mexer em certificado/trafego criptografado. Com --sim, passe --confirmo="CONFIRMO INSPECAO SSL".
+ *
  * O <arquivo.json> e gerado pelo Install-SquidAD.ps1 no servidor AD.
  * Nesta versao todo usuario autenticado acessa tudo. Cada setor (grupo NET_ do
  * AD) vira uma regra no SquidGuard (Groups ACL) que LIBERA TUDO; para restringir,
@@ -49,6 +58,21 @@ foreach ([
 define('SQAD_ESTADO', SQAD_DIR . '/estado.json');
 define('SQAD_CA', SQAD_DIR . '/ca-ad.pem');
 define('SQAD_LOCK', SQAD_DIR . '/sincronizar.lock');
+
+/* --- Inspecao SSL (fase 2, docs/roadmap.md) --- */
+const SQAD_SSL_CA_DESCR = 'pfSense-Squid-AD SSL Proxy CA';
+const SQAD_SSL_CA_DIAS  = 3650;        // 10 anos
+const SQAD_SSL_CA_BITS  = 2048;
+/* ssl-aplicar e ssl-desfazer mexem em certificado e passam a interceptar trafego
+ * criptografado da rede inteira: acesso de admin ao pfSense ja basta para rodar o resto
+ * do projeto, mas aqui pedimos essa frase digitada por extenso, de proposito, para nao
+ * acontecer por engano (Enter sem querer num terminal, script automatizado errado). */
+const SQAD_SSL_FRASE = 'CONFIRMO INSPECAO SSL';
+define('SQAD_SSL_ESTADO', SQAD_DIR . '/ssl-estado.json');
+define('SQAD_SSL_CA_EXPORT', SQAD_DIR . '/ssl-ca.crt');   // so o certificado publico, para distribuir por GPO
+/* Chave SSH remota (Servidor AD -> pfSense): comando forcado, so os subcomandos ssl-* passam,
+ * nada mais - mesmo que o shell do pfSense seja root, essa chave so executa o wrapper abaixo. */
+define('SQAD_SSL_WRAPPER', '/root/squid-ad-ssl-remoto.sh');
 
 /* ======================================================================
  *  Funcoes puras (sem pfSense): testadas no CI em tests/
@@ -476,6 +500,25 @@ function sqad_pergunta(string $texto, bool $padrao, array $opt): bool {
 		if (preg_match('/^[sSyY]/', $r)) { return true; }
 		if (preg_match('/^[nN]/', $r)) { return false; }
 		sqad_msg('aviso', 'responda S ou N (ou ENTER para o padrao).');
+	}
+}
+
+/* Trava extra para ssl-aplicar/ssl-desfazer: tem que digitar a frase exata, ENTER nao vale
+ * como "sim" (diferente de sqad_pergunta). Em --sim, a frase tem que vir em --confirmo=,
+ * para automacao continuar possivel sem abrir mao da intencao explicita. */
+function sqad_confirmar_ssl(array $opt): void {
+	if (!empty($opt['sim'])) {
+		if (($opt['confirmo'] ?? '') === SQAD_SSL_FRASE) { return; }
+		throw new RuntimeException('--sim exige --confirmo="' . SQAD_SSL_FRASE . '" (exatamente assim) para mexer em certificado/inspecao SSL.');
+	}
+	fwrite(STDOUT, "\n    Isso muda como o trafego criptografado da rede e tratado. Para confirmar, digite "
+		. 'exatamente: ' . SQAD_SSL_FRASE . "\n");
+	while (true) {
+		fwrite(STDOUT, '    > ');
+		$r = fgets(STDIN);
+		if ($r === false) { throw new RuntimeException('sem terminal para confirmar: rode por SSH.'); }
+		if (trim($r) === SQAD_SSL_FRASE) { return; }
+		sqad_msg('aviso', 'nao bateu. Digite exatamente "' . SQAD_SSL_FRASE . '", ou Ctrl+C para cancelar.');
 	}
 }
 
@@ -973,6 +1016,377 @@ function sqad_cmd_desfazer(array $opt): int {
 }
 
 /* ======================================================================
+ *  Inspecao SSL (fase 2, docs/roadmap.md)
+ *  Bump so no necessario: splice por padrao (sslproxy_mitm_mode=splicewhitelist),
+ *  so o que esta na Whitelist passa sem abrir. Nunca aceita certificado com erro.
+ * ====================================================================== */
+
+/* Lista padrao do que NUNCA deve ser inspecionado (splice): bancos, governo/ICP-Brasil
+ * (login por certificado A1/A3 nao atravessa um proxy que inspeciona), Windows
+ * Update/Microsoft e antivirus. Uma linha por dominio; squid_nac aceita regex tambem,
+ * mas aqui ficamos com sufixo de dominio simples (mais facil de auditar e manter). */
+function sqad_ssl_lista_padrao(): array {
+	return [
+		// bancos e meios de pagamento
+		'bb.com.br', 'caixa.gov.br', 'itau.com.br', 'bradesco.com.br', 'santander.com.br',
+		'sicoob.com.br', 'sicredi.com.br', 'nubank.com.br', 'inter.co', 'pagseguro.uol.com.br',
+		'mercadopago.com.br', 'picpay.com',
+		// governo e certificado digital ICP-Brasil
+		'gov.br', 'receita.fazenda.gov.br', 'nfe.fazenda.gov.br', 'esocial.gov.br',
+		'conectividade.caixa.gov.br', 'certisign.com.br', 'serasa.com.br', 'soluti.com.br',
+		'valid.com.br', 'iti.gov.br',
+		// Windows Update, Microsoft 365/Teams, antivirus
+		'windowsupdate.com', 'update.microsoft.com', 'microsoft.com', 'office.com',
+		'office365.com', 'live.com', 'sfx.ms',
+		'avast.com', 'avg.com', 'kaspersky.com', 'eset.com', 'trendmicro.com',
+		'mcafee.com', 'symantec.com', 'bitdefender.com',
+	];
+}
+
+/* Texto da Whitelist do Squid (squid_nac): um dominio por linha, "extras" do cliente
+ * no fim (editavel por fora da lista padrao, sem misturar as duas). */
+function sqad_ssl_whitelist_texto(array $padrao, array $extras = []): string {
+	$linhas = array_values(array_unique(array_merge($padrao, $extras)));
+	sort($linhas);
+	return implode("\n", $linhas) . "\n";
+}
+
+/* Campos que vao para Services > Squid Proxy Server > General (SSL) e > ACLs (Whitelist).
+ * interception_checks fica VAZIO de proposito: aceitar erro de certificado ou nao verificar
+ * esconderia um ataque man-in-the-middle de verdade - e exatamente o que o proxy tem que
+ * barrar. interception_adapt recebe os 3 (imita o certificado original: datas e CN), para
+ * o navegador mostrar dados coerentes do site real quando um dominio for mesmo inspecionado. */
+function sqad_ssl_campos_squid(string $caref): array {
+	return [
+		'ssl_proxy'            => 'on',
+		'ssl_active_interface' => 'lan',
+		'dca'                  => $caref,
+		'sslproxy_mitm_mode'   => 'splicewhitelist',
+		'interception_checks'  => '',
+		'interception_adapt'   => 'setValidAfter,setValidBefore,setCommonName',
+	];
+}
+
+/* ---------------------------- pfSense ---------------------------------- */
+
+/* Todas as CAs do pfSense (System > Cert. Manager > CAs), para o usuario escolher: este
+ * script pode rodar em clientes diferentes, cada um com sua propria pratica de CA (uma ja
+ * emitida para outra coisa, nomes proprios, validade proprias). Nunca assumimos uma CA
+ * "do projeto" fixa. */
+function sqad_ssl_listar_cas(): array {
+	return config_get_path('ca', []) ?: [];
+}
+
+/* Cria uma CA nova (RSA ou tamanho/validade escolhidos) e adiciona ao Cert. Manager. */
+function sqad_ssl_ca_criar(string $nome, int $bits, int $dias): array {
+	$dn = ['countryName' => 'BR', 'organizationName' => 'pfSense-Squid-AD', 'commonName' => $nome];
+	$ca = ['refid' => uniqid(), 'descr' => $nome];
+	if (!ca_create($ca, $bits, $dias, $dn)) {
+		throw new RuntimeException('nao consegui gerar a CA (openssl falhou)');
+	}
+	config_set_path('ca/' . count(config_get_path('ca', []) ?: []), $ca);
+	return $ca;
+}
+
+/* Pergunta interativa: usar uma CA que ja existe no pfSense, ou criar uma nova (com nome,
+ * tamanho de chave e validade escolhidos na hora, sem valor fixo do projeto). Em --sim
+ * (sem terminal, ex.: Command Prompt do pfSense) cria uma nova com os valores padrao, para
+ * nao escolher uma CA existente sem o usuario ter visto a lista. */
+function sqad_ssl_escolher_ca(array $opt): array {
+	$cas = sqad_ssl_listar_cas();
+	if (!empty($opt['sim'])) {
+		sqad_msg('info', '--sim: criando CA nova "' . SQAD_SSL_CA_DESCR . '" (RSA ' . SQAD_SSL_CA_BITS . ' bits, ' . SQAD_SSL_CA_DIAS . ' dias). Para usar uma CA existente, rode sem --sim.');
+		return sqad_ssl_ca_criar(SQAD_SSL_CA_DESCR, SQAD_SSL_CA_BITS, SQAD_SSL_CA_DIAS);
+	}
+	if ($cas) {
+		fwrite(STDOUT, "\n    CAs que ja existem neste pfSense (System > Cert. Manager):\n");
+		foreach ($cas as $i => $ca) {
+			fwrite(STDOUT, sprintf("      %d) %s\n", $i + 1, $ca['descr'] ?? '(sem nome)'));
+		}
+		fwrite(STDOUT, "      0) criar uma CA nova\n");
+		while (true) {
+			$r = trim(sqad_ler_texto('Numero da CA a usar (0 para criar nova)'));
+			if ($r === '0') { break; }
+			if (ctype_digit($r) && isset($cas[(int)$r - 1])) {
+				$escolhida = $cas[(int)$r - 1];
+				sqad_msg('ok', 'usando a CA existente: ' . ($escolhida['descr'] ?? $escolhida['refid']));
+				return $escolhida;
+			}
+			sqad_msg('aviso', 'numero invalido, tente de novo.');
+		}
+	} else {
+		sqad_msg('info', 'nao ha nenhuma CA ainda neste pfSense; vamos criar uma.');
+	}
+	$nome = sqad_ler_texto('Nome da nova CA') ?: SQAD_SSL_CA_DESCR;
+	if ($nome === '') { $nome = SQAD_SSL_CA_DESCR; }
+	$bits = (int)(sqad_ler_texto('Tamanho da chave em bits (ENTER = ' . SQAD_SSL_CA_BITS . ')') ?: SQAD_SSL_CA_BITS);
+	$dias = (int)(sqad_ler_texto('Validade em dias (ENTER = ' . SQAD_SSL_CA_DIAS . ', ~' . round(SQAD_SSL_CA_DIAS / 365) . ' anos)') ?: SQAD_SSL_CA_DIAS);
+	$ca = sqad_ssl_ca_criar($nome, $bits, $dias);
+	sqad_msg('ok', "CA criada: {$nome} (RSA {$bits} bits, {$dias} dias)");
+	return $ca;
+}
+
+/* So o certificado publico (sem a chave privada) - e isso que vai para a GPO/Firefox,
+ * nunca o .pem inteiro. */
+function sqad_ssl_ca_exportar(array $ca, string $destino): void {
+	$pem = base64_decode($ca['crt']);
+	if ($pem === false || $pem === '') { throw new RuntimeException('CA sem certificado para exportar'); }
+	file_put_contents($destino, $pem);
+	chmod($destino, 0644);   // publico de proposito: e so o certificado, sem segredo
+}
+
+function sqad_ssl_backup(array $nac_antes, array $squid_antes): string {
+	@mkdir(SQAD_BACKUPS, 0700, true);
+	$ts = date('Ymd-His');
+	$arq = SQAD_BACKUPS . "/ssl-{$ts}.json";
+	file_put_contents($arq, json_encode(['squidnac' => $nac_antes, 'squid_ssl' => $squid_antes], JSON_PRETTY_PRINT));
+	chmod($arq, 0600);
+	copy(SQAD_CONFIGXML, SQAD_BACKUPS . "/config-ssl-{$ts}.xml");
+	return $arq;
+}
+
+/* Sites criticos testados de verdade pelo proxy (sem bump, tem que fechar sem erro de
+ * certificado) antes de qualquer setor ser ligado. */
+function sqad_ssl_sites_teste(): array {
+	return [
+		'https://www.bb.com.br',
+		'https://gov.br',
+		'https://www.gov.br',
+		'https://cav.receita.fazenda.gov.br',
+		'https://www.esocial.gov.br',
+		'https://www.microsoft.com',
+		'https://login.microsoftonline.com',
+	];
+}
+
+/* Testa cada site atraves do proxy local (com a autenticacao do usuario informado) e
+ * devolve [site => [ok, detalhe]]. ok=true exige HTTP respondido E certificado validado
+ * pelo curl (sem -k): e a prova de que o site saiu em splice, com o certificado real. */
+function sqad_ssl_testar_sites(string $usuario, string $senha, int $porta, array $sites): array {
+	$resultado = [];
+	foreach ($sites as $site) {
+		$cmd = sprintf(
+			'curl -s -o /dev/null -w "%%{http_code} %%{ssl_verify_result}" --max-time 12 -x %s %s 2>&1',
+			escapeshellarg(sprintf('http://%s:%s@127.0.0.1:%d', rawurlencode($usuario), rawurlencode($senha), $porta)),
+			escapeshellarg($site)
+		);
+		$saida = trim((string)shell_exec($cmd));
+		[$codigo, $verify] = array_pad(explode(' ', $saida), 2, '');
+		$ok = ($codigo !== '' && (int)$codigo < 400 && $verify === '0');
+		$resultado[$site] = [$ok, $ok ? "HTTP {$codigo}, certificado OK" : "HTTP {$codigo}, ssl_verify_result={$verify}"];
+	}
+	return $resultado;
+}
+
+/* ---------------------------- comandos ---------------------------------- */
+
+function sqad_cmd_ssl_aplicar(array $opt, bool $simular): int {
+	sqad_carregar_pfsense();
+	$padrao = sqad_ssl_lista_padrao();
+	sqad_msg('passo', 'Lista "nunca inspecionar" (splice), ' . count($padrao) . ' dominios');
+	sqad_msg('info', 'bancos, gov.br/e-CAC/SEFAZ/eSocial, Windows Update, Microsoft 365, antivirus - ver docs/roadmap.md');
+
+	$nac_antes = config_get_path('installedpackages/squidnac/config/0', []) ?: [];
+	$squid_antes_full = config_get_path('installedpackages/squid/config/0', []) ?: [];
+	$squid_antes = array_intersect_key($squid_antes_full, sqad_ssl_campos_squid('x'));
+
+	if ($simular) {
+		sqad_msg('passo', 'CA do proxy (cada cliente escolhe a sua ao rodar "ssl-aplicar" de verdade)');
+		$cas = sqad_ssl_listar_cas();
+		if ($cas) {
+			sqad_msg('info', 'CAs ja existentes neste pfSense: ' . implode(', ', array_column($cas, 'descr')));
+		} else {
+			sqad_msg('info', 'nenhuma CA existe ainda; "ssl-aplicar" vai pedir um nome para criar uma.');
+		}
+		sqad_msg('passo', 'O que "ssl-aplicar" muda em Services > Squid Proxy Server (General e ACLs)');
+		$dif = sqad_diferencas($squid_antes, sqad_ssl_campos_squid('<CA escolhida>'));
+		fwrite(STDOUT, ($dif ? implode("\n", $dif) : '  (nada: ja esta igual)') . "\n");
+		sqad_msg('info', 'modo: splice por padrao, bump so quem NAO esta na Whitelist');
+		sqad_msg('info', 'Remote Cert Checks: nenhuma marcada (nunca aceita certificado com erro)');
+		sqad_msg('info', 'Certificate Adapt: imita validade e CN do certificado original');
+		sqad_msg('info', 'simulacao: nada foi alterado.');
+		return 0;
+	}
+
+	sqad_msg('passo', 'Inspecao SSL: escolha da CA');
+	$ca = sqad_ssl_escolher_ca($opt);
+
+	sqad_msg('passo', 'O que muda em Services > Squid Proxy Server (General e ACLs)');
+	$novo_squid = sqad_ssl_campos_squid($ca['refid']);
+	$dif = sqad_diferencas($squid_antes, $novo_squid);
+	fwrite(STDOUT, ($dif ? implode("\n", $dif) : '  (nada: ja esta igual)') . "\n");
+	sqad_msg('info', 'modo: splice por padrao, bump so quem NAO esta na Whitelist');
+	sqad_msg('info', 'Remote Cert Checks: nenhuma marcada (nunca aceita certificado com erro)');
+	sqad_msg('info', 'Certificate Adapt: imita validade e CN do certificado original');
+
+	if (!sqad_pergunta('Aplicar a inspecao SSL agora?', false, $opt)) { return 1; }
+
+	sqad_confirmar_ssl($opt);
+
+	$backup = sqad_ssl_backup($nac_antes, $squid_antes);
+	sqad_msg('ok', "backup: {$backup}");
+
+	sqad_ssl_ca_exportar($ca, SQAD_SSL_CA_EXPORT);
+	sqad_msg('ok', 'certificado publico exportado em ' . SQAD_SSL_CA_EXPORT . ' (para a GPO, fase seguinte)');
+
+	config_set_path('installedpackages/squidnac/config/0', array_merge($nac_antes, [
+		'whitelist' => base64_encode(sqad_ssl_whitelist_texto($padrao, $nac_antes['whitelist_extra'] ?? [])),
+	]));
+	config_set_path('installedpackages/squid/config/0', array_merge($squid_antes_full, sqad_ssl_campos_squid($ca['refid'])));
+	write_config('pfSense-Squid-AD: inspecao SSL aplicada (splice por padrao)');
+
+	require_once(SQAD_SQUIDINC);
+	squid_resync();
+	sqad_msg('ok', 'Squid reiniciado com o SSL bump.');
+
+	file_put_contents(SQAD_SSL_ESTADO, json_encode([
+		'AplicadoEm' => date('c'),
+		'Backup'     => $backup,
+		'CaRefid'    => $ca['refid'],
+	]));
+
+	sqad_msg('passo', 'Proximo passo: "php squid-ad.php ssl-testar" com um usuario real, ANTES de ligar qualquer GPO.');
+	return 0;
+}
+
+function sqad_cmd_ssl_testar(array $opt): int {
+	sqad_carregar_pfsense();
+	$squid = config_get_path('installedpackages/squid/config/0', []) ?: [];
+	if (($squid['ssl_proxy'] ?? '') !== 'on') {
+		throw new RuntimeException('a inspecao SSL nao esta ligada (rode "ssl-aplicar" primeiro)');
+	}
+	$porta = (int)($squid['proxy_port'] ?? 3128);
+	$usuario = $opt['pos'][1] ?? sqad_ler_texto('Usuario do AD para o teste (precisa valer para o proxy)');
+	$senha   = sqad_ler_texto('Senha', true);
+
+	sqad_msg('passo', 'Testando sites criticos pelo proxy (porta ' . $porta . '), sem -k: tem que fechar com certificado valido de verdade');
+	$sites = sqad_ssl_sites_teste();
+	$res = sqad_ssl_testar_sites($usuario, $senha, $porta, $sites);
+	$falhas = 0;
+	foreach ($res as $site => [$ok, $detalhe]) {
+		sqad_msg($ok ? 'ok' : 'aviso', "{$site}: {$detalhe}");
+		if (!$ok) { $falhas++; }
+	}
+	if ($falhas > 0) {
+		sqad_msg('aviso', "{$falhas} site(s) com problema. NAO ligue a GPO em nenhum setor ate corrigir (confira a Whitelist e o DNS do pfSense).");
+		return 1;
+	}
+	sqad_msg('ok', 'todos os sites criticos passaram em splice, com certificado real validado.');
+	return 0;
+}
+
+function sqad_cmd_ssl_status(): int {
+	sqad_carregar_pfsense();
+	$squid = config_get_path('installedpackages/squid/config/0', []) ?: [];
+	$nac = config_get_path('installedpackages/squidnac/config/0', []) ?: [];
+	$estado = json_decode((string)@file_get_contents(SQAD_SSL_ESTADO), true);
+	sqad_msg('passo', 'Status: inspecao SSL');
+	sqad_msg('info', 'ligada:       ' . (($squid['ssl_proxy'] ?? '') === 'on' ? 'SIM' : 'nao'));
+	sqad_msg('info', 'modo:         ' . ($squid['sslproxy_mitm_mode'] ?? '(default)'));
+	$ca_nome = '(nenhuma)';
+	if (!empty($squid['dca'])) {
+		foreach (sqad_ssl_listar_cas() as $ca) {
+			if (($ca['refid'] ?? '') === $squid['dca']) { $ca_nome = $ca['descr'] ?? $squid['dca']; break; }
+		}
+	}
+	sqad_msg('info', 'CA em uso:    ' . $ca_nome);
+	$wl = trim((string)base64_decode($nac['whitelist'] ?? ''));
+	sqad_msg('info', 'whitelist:    ' . ($wl === '' ? '(vazia)' : count(explode("\n", $wl)) . ' dominio(s)'));
+	if ($estado) {
+		sqad_msg('info', "aplicado em:  {$estado['AplicadoEm']} (backup: {$estado['Backup']})");
+	} else {
+		sqad_msg('info', 'ainda nao foi aplicado por aqui (sem registro de estado).');
+	}
+	return 0;
+}
+
+function sqad_cmd_ssl_desfazer(array $opt): int {
+	sqad_carregar_pfsense();
+	$estado = json_decode((string)@file_get_contents(SQAD_SSL_ESTADO), true);
+	if (!$estado || !is_readable($estado['Backup'] ?? '')) { throw new RuntimeException('nao achei o backup da inspecao SSL (' . SQAD_SSL_ESTADO . ')'); }
+	$b = json_decode(file_get_contents($estado['Backup']), true);
+	sqad_msg('passo', "Desfazer inspecao SSL: voltar como estava ANTES de {$estado['AplicadoEm']}");
+	sqad_msg('info', 'a CA continua em System > Cert. Manager (inofensiva); remova a mao se nao for mais usar.');
+	if (!sqad_pergunta('Desfazer agora?', true, $opt)) { return 1; }
+
+	sqad_confirmar_ssl($opt);
+
+	config_set_path('installedpackages/squidnac/config/0', $b['squidnac'] ?: []);
+	$squid_atual = config_get_path('installedpackages/squid/config/0', []) ?: [];
+	config_set_path('installedpackages/squid/config/0', array_merge($squid_atual, $b['squid_ssl'] ?: ['ssl_proxy' => '']));
+	write_config('pfSense-Squid-AD: inspecao SSL desfeita');
+
+	require_once(SQAD_SQUIDINC);
+	squid_resync();
+	@unlink(SQAD_SSL_ESTADO);
+	sqad_msg('ok', 'inspecao SSL desligada e Squid reiniciado.');
+	return 0;
+}
+
+/* Conteudo do wrapper que a chave SSH restrita executa: $SSH_ORIGINAL_COMMAND e o comando que o
+ * cliente SSH pediu (o OpenSSH sempre preenche essa variavel quando "command=" esta em uso). So
+ * passa se for exatamente um dos 5 subcomandos ssl-*, com ou sem os argumentos deles - qualquer
+ * outra coisa (outro comando, shell, scp, port-forward) e recusada aqui, mesmo que a chave vaze. */
+function sqad_ssl_wrapper_conteudo(): string {
+	$php = '/usr/local/bin/php';
+	$script = SQAD_SCRIPT_FIXO;
+	return "#!/bin/sh\n"
+		. "# Gerado por 'squid-ad.php ssl-chave-remota' - nao edite a mao, rode o comando de novo para atualizar.\n"
+		. "case \"\$SSH_ORIGINAL_COMMAND\" in\n"
+		. "  \"ssl-simular\"|\"ssl-aplicar\"|\"ssl-aplicar --sim --confirmo=" . SQAD_SSL_FRASE . "\"|\"ssl-testar \"*|\"ssl-status\"|\"ssl-desfazer\"|\"ssl-desfazer --sim --confirmo=" . SQAD_SSL_FRASE . "\")\n"
+		. "    exec {$php} {$script} \$SSH_ORIGINAL_COMMAND\n"
+		. "    ;;\n"
+		. "  *)\n"
+		. "    echo 'bloqueado: essa chave so roda os comandos ssl-* deste projeto.' >&2\n"
+		. "    exit 1\n"
+		. "    ;;\n"
+		. "esac\n";
+}
+
+function sqad_ssl_cmd_chave_remota(array $opt): int {
+	sqad_carregar_pfsense();
+	$usuario = $opt['pos'][1] ?? '';
+	$arquivo = $opt['pos'][2] ?? '';
+	if ($usuario === '' || $arquivo === '') {
+		throw new RuntimeException('uso: ssl-chave-remota <usuario-do-pfsense> <arquivo-com-a-chave-publica.pub>');
+	}
+	if (!is_readable($arquivo)) { throw new RuntimeException("nao consegui ler {$arquivo}"); }
+	$chave = trim((string)file_get_contents($arquivo));
+	if (!preg_match('/^(ssh-ed25519|ssh-rsa|ecdsa-sha2-\S+)\s+\S+/', $chave)) {
+		throw new RuntimeException('isso nao parece uma chave PUBLICA ssh (comeca com ssh-ed25519/ssh-rsa/ecdsa-...). Confira se nao mandou a chave PRIVADA por engano.');
+	}
+
+	$usuarios = config_get_path('system/user', []) ?: [];
+	$idx = null;
+	foreach ($usuarios as $i => $u) { if (($u['name'] ?? '') === $usuario) { $idx = $i; break; } }
+	if ($idx === null) { throw new RuntimeException("usuario \"{$usuario}\" nao existe no pfSense (System > User Manager)."); }
+
+	sqad_msg('passo', "Instalar chave SSH restrita para o usuario \"{$usuario}\" (so roda ssl-simular/ssl-aplicar/ssl-testar/ssl-status/ssl-desfazer)");
+	sqad_msg('info', 'nenhum outro comando passa por essa chave, mesmo que o shell do pfSense seja root.');
+	if (!sqad_pergunta('Instalar agora?', true, $opt)) { return 1; }
+
+	@mkdir(SQAD_BACKUPS, 0700, true);
+	copy(SQAD_CONFIGXML, SQAD_BACKUPS . '/config-ssl-chave-' . date('Ymd-His') . '.xml');
+
+	file_put_contents(SQAD_SSL_WRAPPER, sqad_ssl_wrapper_conteudo());
+	chmod(SQAD_SSL_WRAPPER, 0700);
+
+	$linha = 'command="' . SQAD_SSL_WRAPPER . '",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ' . $chave;
+	$existentes = array_filter(explode("\n", base64_decode($usuarios[$idx]['authorizedkeys'] ?? '')));
+	$chave_ja_tinha = false;
+	foreach ($existentes as $l) { if (str_contains($l, $chave)) { $chave_ja_tinha = true; break; } }
+	if (!$chave_ja_tinha) { $existentes[] = $linha; }
+	config_set_path("system/user/{$idx}/authorizedkeys", base64_encode(implode("\n", $existentes) . "\n"));
+	write_config('pfSense-Squid-AD: chave SSH restrita para inspecao SSL remota (Servidor AD)');
+
+	sqad_msg('ok', $chave_ja_tinha ? 'chave ja estava instalada; wrapper atualizado.' : 'chave instalada.');
+	sqad_msg('info', 'proximo passo (uma vez so): restrinja o acesso SSH desse usuario a rede interna '
+		. '(System > Advanced > Admin Access > "SSH" / regra de firewall), nunca deixe aberto na WAN.');
+	sqad_msg('info', 'do Servidor AD, teste com: ssh -i <chave-privada> ' . $usuario . '@<ip-do-pfsense> ssl-status');
+	return 0;
+}
+
+/* ======================================================================
  *  main
  * ====================================================================== */
 
@@ -983,7 +1397,7 @@ function sqad_opcoes(array $argv): array {
 		if ($a === '--sim' || $a === '-y') { $o['sim'] = true; }
 		elseif ($a === '--cron') { $o['cron'] = true; $o['sim'] = true; }
 		elseif ($a === '--forcar') { $o['forcar'] = true; }
-		elseif (preg_match('/^--(dias|usuario|csv)$/', $a, $m)) { $o[$m[1]] = $argv[++$i] ?? ''; }
+		elseif (preg_match('/^--(dias|usuario|csv|confirmo)$/', $a, $m)) { $o[$m[1]] = $argv[++$i] ?? ''; }
 		else { $o['pos'][] = $a; }
 	}
 	return $o;
@@ -1005,10 +1419,18 @@ function sqad_main(array $argv): int {
 			case 'status':    return sqad_cmd_status();
 			case 'sincronizar': return sqad_cmd_sincronizar($o);
 			case 'desfazer':  return sqad_cmd_desfazer($o);
+			case 'ssl-simular': return sqad_cmd_ssl_aplicar($o, true);
+			case 'ssl-aplicar': return sqad_cmd_ssl_aplicar($o, false);
+			case 'ssl-testar':  return sqad_cmd_ssl_testar($o);
+			case 'ssl-status':  return sqad_cmd_ssl_status();
+			case 'ssl-desfazer': return sqad_cmd_ssl_desfazer($o);
+			case 'ssl-chave-remota': return sqad_ssl_cmd_chave_remota($o);
 			default:
 				fwrite(STDOUT, "\n  Uso: php squid-ad.php simular|aplicar <arquivo.json> [--sim]\n"
 					. "       php squid-ad.php testar <usuario> | relatorio [--dias N] [--usuario X] [--csv arq] | status | desfazer\n"
-					. "       php squid-ad.php sincronizar [--forcar]   (o cron roda a cada 15 min)\n");
+					. "       php squid-ad.php sincronizar [--forcar]   (o cron roda a cada 15 min)\n"
+					. "       php squid-ad.php ssl-simular | ssl-aplicar [--sim] | ssl-testar <usuario> | ssl-status | ssl-desfazer\n"
+					. "       php squid-ad.php ssl-chave-remota <usuario-pfsense> <chave-publica.pub>   (acesso remoto do Servidor AD)\n");
 				return $cmd === '' ? 0 : 2;
 		}
 	} catch (Throwable $e) {
