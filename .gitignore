@@ -1,0 +1,4 @@
+# Arquivos gerados pelo Install-SquidAD.ps1: podem ter a senha da conta de servico
+squid-ad-*.json
+*.pem
+!tests/**

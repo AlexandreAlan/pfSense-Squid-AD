@@ -1,0 +1,41 @@
+name: Testes
+
+# A cada push/PR:
+#  - windows:  parser do Windows PowerShell 5.1 DE VERDADE (o dos servidores AD)
+#              + PSScriptAnalyzer com a regra de compatibilidade 5.1
+#  - linux:    suite completa (tests/run-testes.sh): funcoes do script do AD
+#              contra um servidor TLS local, e o fluxo do script do pfSense
+#              (simular/aplicar/desfazer/relatorio) com o JSON gerado pelo AD
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parser do Windows PowerShell 5.1
+        shell: powershell
+        run: .\tests\Test-Sintaxe.ps1
+
+      - name: PSScriptAnalyzer (compatibilidade 5.1)
+        shell: pwsh
+        run: .\tests\Test-Sintaxe.ps1 -Analyzer
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PHP com LDAP
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q php-cli php-ldap
+          php -v | head -1
+
+      - name: Suite completa
+        run: bash tests/run-testes.sh
