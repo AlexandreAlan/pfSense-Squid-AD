@@ -49,7 +49,6 @@ Além dos testes automáticos, as decisões sobre o squidGuard foram **provadas 
 
 Os testes também passam por **prova de mutação**: cada comportamento crítico é estragado de propósito numa cópia e o teste correspondente tem que reprovar.
 
-## Próximos passos (roadmap)
+## Próximos passos
 
-- Relatório agendado (diário, por e-mail).
-- Assistente para montar as restrições por setor (sugestão de *Target categories* a partir do relatório).
+Veja o [Roteiro](roadmap.md): a próxima fase é a inspeção SSL (HTTPS) automatizada.
