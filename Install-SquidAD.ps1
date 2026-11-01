@@ -54,13 +54,38 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$VersaoProjeto = '1.1.1'
+$VersaoProjeto = '1.2.0'
 $Aqui = Split-Path -Parent $MyInvocation.MyCommand.Definition
 # Padroes que costumam indicar grupo de SETOR (ex.: SETOR-FINANCEIRO, DEP_COMPRAS)
 $PadraoSetor = '^(SETOR|SET|DEP|DEPTO|DEPARTAMENTO|GRP|GG|GS)[-_ .]'
 
 # ------------------------------ helpers -------------------------------
-function Step([string]$m) { Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
+$script:Passo = 0
+$script:TotalPassos = 9
+# Cabecalho de passo: numerado e separado por linhas, para a pessoa saber onde esta.
+function Step([string]$m) {
+    $script:Passo++
+    $linha = '  ' + ('-' * 72)
+    Write-Host ''
+    Write-Host ''
+    Write-Host $linha -ForegroundColor DarkCyan
+    Write-Host ("   PASSO {0} de {1}  -  {2}" -f $script:Passo, $script:TotalPassos, $m) -ForegroundColor Cyan
+    Write-Host $linha -ForegroundColor DarkCyan
+}
+
+# Explicacao padrao de cada passo: o que e, por que, o que acontece. Cada parte
+# aceita varias linhas. Fica entre linhas em branco, separada das perguntas.
+function Explicar([string[]]$OQue, [string[]]$PorQue, [string[]]$Acontece) {
+    Write-Host ''
+    foreach ($par in @(@('O QUE E:', $OQue), @('POR QUE:', $PorQue), @('O QUE ACONTECE:', $Acontece))) {
+        $texto = @($par[1] | Where-Object { $_ })
+        if (-not $texto.Count) { continue }
+        Write-Host ("   {0,-17}" -f $par[0]) -NoNewline -ForegroundColor White
+        Write-Host $texto[0] -ForegroundColor Gray
+        foreach ($l in @($texto | Select-Object -Skip 1)) { Write-Host ("   {0,-17}{1}" -f '', $l) -ForegroundColor Gray }
+    }
+    Write-Host ''
+}
 function Ok([string]$m)   { Write-Host "    OK  $m" -ForegroundColor Green }
 function Warn([string]$m) { Write-Host "    !!  $m" -ForegroundColor Yellow }
 function Info([string]$m) { Write-Host "        $m" }
@@ -292,6 +317,7 @@ function Sync-SetoresAD([string]$BaseOu, [string]$Prefixo, [bool]$Interativo, [s
     $ous = @(Get-ADOrganizationalUnit -SearchBase $BaseOu -SearchScope OneLevel -Filter * | Sort-Object Name)
     foreach ($ou in $ous) {
         if ($ignoradas -contains [string]$ou.DistinguishedName) { continue }
+        if ($Interativo) { Write-Host '' }
         $nome = $Prefixo + (ConvertTo-NomeSetor $ou.Name)
         $usuarios = @(Get-ADUser -SearchBase $ou.DistinguishedName -SearchScope Subtree -Filter 'Enabled -eq $true' -Properties Description)
         $g = Get-ADGroup -Filter "Name -eq '$nome'" -ErrorAction SilentlyContinue
@@ -354,10 +380,16 @@ if ($Sincronizar) {
 }
 
 Write-Host ''
-Write-Host "  pfSense-Squid-AD $VersaoProjeto - preparar o AD para o login do Squid" -ForegroundColor White
-Write-Host '  -----------------------------------------------------------------'
-Write-Host '  Responda com S ou N. O padrao aparece entre [colchetes]: ENTER aceita.'
-Write-Host '  Nada e criado ou alterado no AD sem voce responder S.'
+Write-Host ''
+Write-Host '  ========================================================================' -ForegroundColor DarkCyan
+Write-Host "   pfSense-Squid-AD $VersaoProjeto  -  preparar o AD para o login do proxy" -ForegroundColor White
+Write-Host '  ========================================================================' -ForegroundColor DarkCyan
+Write-Host ''
+Write-Host '   Sao 9 passos. Em cada um aparece o que vai ser feito e por que.'
+Write-Host '   Responda com S (sim) ou N (nao). O padrao aparece entre [colchetes]:'
+Write-Host '   apertar ENTER aceita o padrao.'
+Write-Host ''
+Write-Host '   Nada e criado ou alterado no AD sem voce responder S.' -ForegroundColor Yellow
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -370,16 +402,21 @@ try { Import-Module ActiveDirectory -ErrorAction Stop }
 catch { throw 'Modulo ActiveDirectory nao encontrado. Rode no controlador de dominio ou instale o RSAT (Ferramentas do AD DS).' }
 
 # ------------------------------ 1. dominio -----------------------------
-Step 'Dominio'
+Step 'Dominio do Active Directory'
+Explicar -OQue 'O dominio do AD onde estao os usuarios da empresa.' `
+         -PorQue 'E nele que o pfSense vai conferir o usuario e a senha de quem navega.' `
+         -Acontece 'So leitura. Nada e alterado.'
 $dom = Get-ADDomain
 Ok "$($dom.DNSRoot)  (NetBIOS $($dom.NetBIOSName), base $($dom.DistinguishedName))"
 if (-not (Read-SimNao "Usar o dominio $($dom.DNSRoot)?" $true)) { throw 'Cancelado: dominio nao confirmado.' }
 
 # --------------------------- 2. controlador ----------------------------
 Step 'Controlador de dominio'
-Info 'O pfSense vai consultar este servidor a cada login. Ele precisa ser alcancavel'
-Info 'pelo pfSense (normalmente pela LAN).'
-Info '("site" aqui e o Site do Active Directory - local fisico em Sites e Servicos do AD.)'
+Explicar -OQue 'O servidor do AD que o pfSense vai consultar a cada login.' `
+         -PorQue @('Ele precisa ser alcancavel pelo pfSense, normalmente pela LAN.',
+                   '("site" na lista e o Site do AD - local fisico em Sites e Servicos -',
+                   ' nao um site da internet.)') `
+         -Acontece 'So leitura. O nome e o IP escolhidos vao no arquivo para o pfSense.'
 $dcs = @(Get-ADDomainController -Filter * | Sort-Object HostName)
 $esteDc = $dcs | Where-Object { $_.Name -ieq $env:COMPUTERNAME } | Select-Object -First 1
 $padraoDc = if ($esteDc) { [array]::IndexOf($dcs, $esteDc) + 1 } else { 1 }
@@ -422,16 +459,20 @@ $escolha = Read-Valor 'Controlador (numero ou nome)' "$padraoDc" {
 $dc = if ($escolha -match '^\d+$') { $dcs[[int]$escolha - 1] } else { $dcs | Where-Object { $_.Name -ieq $escolha -or $_.HostName -ieq $escolha } | Select-Object -First 1 }
 $dcHost = [string]$dc.HostName
 $ips = @($ipsDc[$dcHost])
-Info 'IP do controlador que o pfSense vai usar (normalmente o da LAN, ex.: 172.16.10.x):'
+Write-Host ''
+Info 'Agora o IP do controlador que o pfSense vai usar (o da LAN, ex.: 172.16.10.x):'
 $dcIp = Read-Valor 'IP do controlador' $(if ($ips.Count) { $ips[0] } else { '' }) {
     param($v) $v -match '^((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)$' -and $v -notlike '169.254.*' -and $v -notlike '127.*'
 } 'digite o IPv4 da LAN do controlador (nao vale 169.254.x.x nem 127.x.x.x).'
 Ok "controlador: $dcHost ($dcIp)"
 
 # ------------------------------ 3. LDAPS -------------------------------
-Step "LDAPS (porta 636) em $dcHost"
-Info 'O pfSense vai mandar as senhas dos usuarios para o AD. Com LDAPS isso vai'
-Info 'criptografado. LDAPS exige um certificado no controlador de dominio.'
+Step "LDAPS - conexao criptografada com $dcHost"
+Explicar -OQue 'A conexao criptografada (porta 636) entre o pfSense e o AD.' `
+         -PorQue @('O pfSense envia a senha de cada usuario para o AD conferir.',
+                   'Ela nao pode trafegar aberta na rede.') `
+         -Acontece @('So leitura. Confere o certificado do controlador e copia a CA',
+                     '(quem emitiu o certificado) para o pfSense confiar nela.')
 $transporte = 'ssl'; $porta = 636; $caPem = ''
 $ldaps = $null
 try { $ldaps = Get-LdapsInfo $dcHost 636 } catch { Warn "LDAPS nao respondeu: $($_.Exception.Message)" }
@@ -458,10 +499,14 @@ if ($ldaps) {
 
 # ------------------------------ 4. setores -----------------------------
 Step 'Setores (grupos de internet)'
-Info 'Cada setor vira um grupo SO de internet (ex.: NET_FINANCEIRO), separado dos'
-Info 'grupos de pastas (GR_/GRE_). Nesta versao TODOS acessam tudo: no pfSense cada'
-Info 'setor vira uma regra no SquidGuard que libera tudo, pronta para restringir depois.'
-Info 'Quem nao estiver em nenhum setor tambem acessa tudo e aparece como "SEM SETOR".'
+Explicar -OQue @('Cada OU de departamento vira um SETOR, com um grupo so de internet',
+                 '(ex.: OU Financeiro -> grupo NET_FINANCEIRO, criado dentro da OU).') `
+         -PorQue @('Fica separado dos grupos de pastas (GR_/GRE_): dar acesso a uma pasta',
+                   'nao muda a internet de ninguem.') `
+         -Acontece @('Para cada OU voce responde S ou N. O grupo recebe os usuarios que',
+                     'estao na OU. Nesta versao TODOS acessam tudo: no pfSense cada setor',
+                     'vira uma regra no SquidGuard que libera tudo, pronta para restringir.',
+                     'Quem estiver fora dos departamentos aparece como "SEM SETOR".')
 $setores = New-Object System.Collections.Generic.List[object]
 $sync = $null
 $topo = @(Get-ADOrganizationalUnit -SearchBase $dom.DistinguishedName -SearchScope OneLevel -Filter * |
@@ -476,11 +521,16 @@ if ($topo.Count) {
     $nOu = Read-Valor 'OU da empresa (onde ficam as OUs de departamento)' "$padraoOu" { param($v) $v -match '^\d+$' -and [int]$v -ge 1 -and [int]$v -le $topo.Count } "digite um numero de 1 a $($topo.Count)."
     $empresa = $topo[[int]$nOu - 1]
     $deps = @(Get-ADOrganizationalUnit -SearchBase $empresa.DistinguishedName -SearchScope OneLevel -Filter * | Sort-Object Name)
-    Info ("departamentos em '{0}': {1}" -f $empresa.Name, (($deps | ForEach-Object { $_.Name }) -join ', '))
+    Write-Host ''
+    Info ("Departamentos encontrados em '{0}':" -f $empresa.Name)
+    foreach ($dp in $deps) { Info "    - $($dp.Name)" }
+    Write-Host ''
     if ($deps.Count -and (Read-SimNao "Cada OU dentro de '$($empresa.Name)' e um departamento (setor)?" $true)) {
         $prefixo = Read-Valor 'Prefixo dos grupos de internet' 'NET_' { param($v) $v -match '^[A-Za-z][A-Za-z0-9_-]{0,9}$' } 'use ate 10 caracteres: letras, numeros, _ ou -, comecando com letra.'
-        Info 'Para cada departamento: o grupo fica DENTRO da OU dele e recebe os usuarios ativos'
-        Info 'que estao nela (espelhado). Usuario com [proxy-manual] na Descricao nunca e tirado.'
+        Write-Host ''
+        Info 'Agora, departamento por departamento. Dica: responda N para OUs que nao sao'
+        Info 'de pessoas (ex.: Computadores). Usuario com [proxy-manual] na Descricao nunca'
+        Info 'e tirado de um grupo.'
         # Rodando de novo: respeita as OUs recusadas antes (configuracao da tarefa)
         $ignorarAntes = @()
         $cfgAntiga = Join-Path (Join-Path $env:ProgramData 'pfSense-Squid-AD') 'sincronizacao.json'
@@ -522,9 +572,13 @@ if ($setores.Count -eq 0) { Warn 'nenhum setor escolhido: todos aparecem como "S
 else { Ok "setores: $(($setores | ForEach-Object { $_.Name }) -join ', ')" }
 
 # ------------------------- 5. conta de servico -------------------------
-Step 'Conta de servico (so leitura)'
-Info 'O pfSense usa uma conta propria para procurar o usuario no AD antes de conferir'
-Info 'a senha dele. Ela so LE o AD: nao e admin e nao precisa de permissao especial.'
+Step 'Conta de servico do pfSense (so leitura)'
+Explicar -OQue 'Uma conta propria do pfSense no AD (padrao: svc-squid-ldap).' `
+         -PorQue @('O pfSense usa essa conta para procurar o usuario no AD antes de',
+                   'conferir a senha dele.') `
+         -Acontece @('Ela so LE o AD: nao e admin. Se for gerada uma senha nova, ela',
+                     'aparece no FIM do script para voce guardar, e o pfSense recebe a',
+                     'nova pelo arquivo. Para manter a senha atual, responda N e digite-a.')
 $svcNome = Read-Valor 'Nome da conta de servico' 'svc-squid-ldap' { param($v) $v -match '^[A-Za-z0-9._-]{3,20}$' } 'use 3 a 20 caracteres: letras, numeros, . _ -'
 $svc = Get-ADUser -Filter "SamAccountName -eq '$svcNome'" -ErrorAction SilentlyContinue
 $svcSenha = $null
@@ -555,7 +609,11 @@ if ($svc) {
 }
 
 # ------------------------------ 6. teste --------------------------------
-Step "Testando o LDAP como o pfSense vai fazer ($transporte, porta $porta)"
+Step "Teste de login (como o pfSense vai fazer)"
+Explicar -OQue "Um login de verdade no AD ($transporte, porta $porta), igual ao que o pfSense fara." `
+         -PorQue 'Achar um problema aqui e muito mais facil do que depois, no firewall.' `
+         -Acontece @('So leitura. Se quiser, testa tambem com um usuario real e mostra o',
+                     'setor dele. A senha digitada nao e gravada.')
 $filtro = '(&(objectCategory=person)(objectClass=user)(sAMAccountName=%s)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
 try {
     $con = Test-LdapBind $dcHost $porta ($transporte -eq 'ssl') $svc.DistinguishedName $svcSenha
@@ -596,10 +654,12 @@ if (-not $Yes -and (Read-SimNao 'Testar o login com um usuario real do AD?' $tru
 $con.Dispose()
 
 # ------------------------------ 7. GPO ----------------------------------
-Step 'GPO do proxy (opcional)'
-Info 'O proxy com login NAO funciona em modo transparente: cada PC precisa apontar'
-Info 'para o pfSense. A GPO faz isso sozinha. Ela e criada SEM vinculo: voce escolhe'
-Info 'em quais OUs ligar (setor por setor) - aqui ou depois, no Gerenciamento de GPO.'
+Step 'GPO do proxy nos PCs (opcional)'
+Explicar -OQue 'Uma politica de grupo que configura o proxy (IP do pfSense:3128) nos PCs.' `
+         -PorQue @('Proxy com login nao funciona em modo transparente: cada PC precisa',
+                   'apontar para o pfSense.') `
+         -Acontece @('A GPO e criada SEM vinculo: nada muda nos PCs ate voce liga-la numa',
+                     'OU (setor por setor), aqui ou depois no Gerenciamento de GPO.')
 $proxy = $null
 if (Read-SimNao 'Criar a GPO que configura o proxy nos PCs?' $false) {
     Import-Module GroupPolicy -ErrorAction Stop
@@ -645,9 +705,11 @@ if (Read-SimNao 'Criar a GPO que configura o proxy nos PCs?' $false) {
 
 # --------------------------- 8. arquivo ---------------------------------
 Step 'Arquivo para o pfSense'
+Explicar -OQue "O arquivo squid-ad-$($dom.NetBIOSName).json, com tudo que o script do pfSense precisa." `
+         -PorQue 'Leva servidor, conta, setores e a CA do LDAPS: nada para digitar no pfSense.' `
+         -Acontece @('Gravado ao lado deste script, so Administradores leem. Se levar a senha',
+                     'da conta de servico, apague o arquivo depois de usar no pfSense.')
 if (-not $OutFile) { $OutFile = Join-Path $Aqui ("squid-ad-{0}.json" -f $dom.NetBIOSName) }
-Info 'O arquivo leva tudo o que o script do pfSense precisa: servidor, base, conta de'
-Info 'servico, setores e a CA do LDAPS.'
 $incluiSenha = Read-SimNao 'Incluir a senha da conta de servico no arquivo? (senao o pfSense pergunta)' $true
 $dados = New-PacoteSquid -Dom $dom -DcHost $dcHost -DcIp $dcIp -Porta $porta -Transporte $transporte `
     -ContaDn $svc.DistinguishedName -ContaUsuario $svcNome -ContaSenha $(if ($incluiSenha) { $svcSenha } else { '' }) `
@@ -661,11 +723,14 @@ $svcSenha = $null
 
 # --------------------- 9. sincronizacao automatica ----------------------
 if ($sync) {
-    Step 'Sincronizacao automatica no AD (opcional)'
-    Info 'Uma tarefa agendada (a cada 15 min, como SYSTEM) mantem os setores em dia:'
-    Info '  OU de departamento nova  -> cria o grupo de internet dela'
-    Info '  usuario novo/movido      -> entra no grupo do departamento e sai do antigo'
-    Info 'O pfSense, por sua vez, traz os grupos novos para o SquidGuard sozinho.'
+    Step 'Sincronizacao automatica (opcional)'
+    Explicar -OQue 'Uma tarefa agendada no Windows (a cada 15 min, como SYSTEM).' `
+             -PorQue 'Manter os setores em dia sem precisar rodar este script de novo.' `
+             -Acontece @('OU de departamento nova   -> ganha o grupo de internet dela',
+                         'usuario novo ou que mudou -> entra no grupo do departamento',
+                         'de departamento              (e sai do antigo)',
+                         'OUs que voce recusou      -> nunca ganham grupo',
+                         'O pfSense, por sua vez, traz os grupos novos para o SquidGuard.')
     if (Read-SimNao 'Criar a tarefa agendada de sincronizacao (a cada 15 min)?' $true) {
         $dirSync = Join-Path $env:ProgramData 'pfSense-Squid-AD'
         if (-not (Test-Path $dirSync)) { New-Item -ItemType Directory -Force $dirSync | Out-Null }

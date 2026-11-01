@@ -20,7 +20,7 @@
  * mexe nisso, so na origem (quem e o setor).
  */
 
-const SQAD_VERSAO    = '1.1.1';
+const SQAD_VERSAO    = '1.2.0';
 const SQAD_MARCA_INI = '# >>> pfSense-Squid-AD (gerado automaticamente - nao edite este bloco) >>>';
 const SQAD_MARCA_FIM = '# <<< pfSense-Squid-AD <<<';
 const SQAD_PROMPT    = 'Proxy da empresa: use seu usuario e senha do Windows';
@@ -394,7 +394,12 @@ function sqad_sg_geral(array $atual, array $p, string $senha): array {
  * ====================================================================== */
 
 function sqad_msg(string $tipo, string $m): void {
-	$pre = ['passo' => "\n==> ", 'ok' => '    OK  ', 'aviso' => '    !!  ', 'info' => '        '][$tipo] ?? '';
+	if ($tipo === 'passo') {   // cabecalho de etapa, separado por linhas e espaco
+		$linha = '  ' . str_repeat('-', 72);
+		fwrite(STDOUT, "\n\n{$linha}\n   {$m}\n{$linha}\n\n");
+		return;
+	}
+	$pre = ['ok' => '    OK  ', 'aviso' => '    !!  ', 'info' => '        '][$tipo] ?? '';
 	fwrite(STDOUT, $pre . $m . "\n");
 }
 
@@ -908,7 +913,8 @@ function sqad_main(array $argv): int {
 	$o = sqad_opcoes($argv);
 	$cmd = $o['pos'][0] ?? '';
 	if (($o['pos'][0] ?? '') !== 'sincronizar' || empty($o['cron'])) {
-		fwrite(STDOUT, "\n  pfSense-Squid-AD " . SQAD_VERSAO . " - login do Squid no Active Directory\n");
+		$l = '  ' . str_repeat('=', 72);
+		fwrite(STDOUT, "\n{$l}\n   pfSense-Squid-AD " . SQAD_VERSAO . "  -  login do proxy (Squid) no Active Directory\n{$l}\n");
 	}
 	try {
 		switch ($cmd) {

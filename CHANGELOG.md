@@ -1,5 +1,11 @@
 # Histórico de versões
 
+## [1.2.0] — 2026-11-01
+
+### Alterado
+- Saída dos scripts mais legível e didática: passos numerados ("PASSO 3 de 9"), cada passo explica **O QUE É / POR QUE / O QUE ACONTECE**, e há linhas em branco separando explicações, perguntas e resultados (inclusive entre departamentos). O script do pfSense ganhou o mesmo espaçamento nas etapas.
+- O texto da conta de serviço explica como manter a senha atual (responder N e digitá-la), para o pfSense não ficar com a senha desatualizada.
+
 ## [1.1.1] — 2026-11-01
 
 ### Corrigido (vistos na AGF)
