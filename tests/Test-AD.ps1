@@ -111,7 +111,18 @@ Cenario '-Yes responde o padrao sem perguntar' {
 }
 $Yes = $false
 
-[Console]::WriteLine('6) Arquivo para o pfSense (contrato com o squid-ad.php)')
+[Console]::WriteLine('6) IPs do controlador')
+Cenario 'APIPA, loopback e repetidos ficam de fora' {
+    $r = @(Select-IPv4Util @('169.254.155.128', '172.16.10.5', '127.0.0.1', '172.16.10.5', '', 'fe80::1', '10.0.0.2'))
+    if (($r -join ',') -ne '172.16.10.5,10.0.0.2') { throw "resultado: $($r -join ',')" }
+    'ok'
+}
+Cenario 'so APIPA -> lista vazia (o script pede o IP)' {
+    if (@(Select-IPv4Util @('169.254.1.1')).Count -ne 0) { throw 'deveria ser vazia' }
+    'ok'
+}
+
+[Console]::WriteLine('7) Arquivo para o pfSense (contrato com o squid-ad.php)')
 Cenario 'New-PacoteSquid gera o JSON que o PHP le' {
     $dom = [pscustomobject]@{ DNSRoot = 'teste.local'; NetBIOSName = 'TESTE'; DistinguishedName = 'DC=teste,DC=local' }
     $setores = @([pscustomobject]@{ Name = 'SETOR-FINANCEIRO'; DistinguishedName = 'CN=SETOR-FINANCEIRO,OU=Setores,DC=teste,DC=local' },

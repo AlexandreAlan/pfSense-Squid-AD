@@ -202,6 +202,18 @@ function New-PacoteSquid($Dom, [string]$DcHost, [string]$DcIp, [int]$Porta, [str
     }
 }
 
+# IPv4 que o pfSense pode usar: tira APIPA (169.254.x.x = placa sem cabo/sem
+# DHCP), loopback e repetidos.
+function Select-IPv4Util([string[]]$Ips) {
+    return @($Ips | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and $_ -notlike '169.254.*' -and $_ -notlike '127.*' } | Select-Object -Unique)
+}
+
+# Registros A de um nome no DNS (vazio se nao resolver).
+function Get-RegistrosA([string]$Nome) {
+    try { return @(Resolve-DnsName -Name $Nome -Type A -ErrorAction Stop | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress }) }
+    catch { return @() }
+}
+
 # ---------------------------- pre-requisitos ---------------------------
 Write-Host ''
 Write-Host "  pfSense-Squid-AD $VersaoProjeto - preparar o AD para o login do Squid" -ForegroundColor White
@@ -229,17 +241,42 @@ if (-not (Read-SimNao "Usar o dominio $($dom.DNSRoot)?" $true)) { throw 'Cancela
 Step 'Controlador de dominio'
 Info 'O pfSense vai consultar este servidor a cada login. Ele precisa ser alcancavel'
 Info 'pelo pfSense (normalmente pela LAN).'
+Info '("site" aqui e o Site do Active Directory - local fisico em Sites e Servicos do AD.)'
 $dcs = @(Get-ADDomainController -Filter * | Sort-Object HostName)
 $esteDc = $dcs | Where-Object { $_.Name -ieq $env:COMPUTERNAME } | Select-Object -First 1
 $padraoDc = if ($esteDc) { [array]::IndexOf($dcs, $esteDc) + 1 } else { 1 }
+$ipsDc = @{}
 for ($i = 0; $i -lt $dcs.Count; $i++) {
-    $marca = if ($dcs[$i] -eq $esteDc) { '  (este servidor)' } else { '' }
-    Info ("{0}. {1}  -  {2}  (site {3}){4}" -f ($i + 1), $dcs[$i].HostName, $dcs[$i].IPv4Address, $dcs[$i].Site, $marca)
+    $d = $dcs[$i]
+    # Todos os IPs do DC: o que o AD informa + os registros A no DNS (+ as placas
+    # deste servidor, se for ele). 169.254.x.x (APIPA) nunca serve para o pfSense.
+    $todos = @([string]$d.IPv4Address) + @(Get-RegistrosA $d.HostName)
+    if ($d -eq $esteDc) {
+        $todos += @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { $_.IPAddress })
+    }
+    $apipa = @($todos | Where-Object { $_ -like '169.254.*' } | Select-Object -Unique)
+    $ipsDc[$d.HostName] = @(Select-IPv4Util $todos)
+    $marca = if ($d -eq $esteDc) { '  (este servidor)' } else { '' }
+    $mostra = if ($ipsDc[$d.HostName].Count) { $ipsDc[$d.HostName] -join ', ' } else { 'sem IP utilizavel' }
+    Info ("{0}. {1}  -  {2}  (site do AD: {3}){4}" -f ($i + 1), $d.HostName, $mostra, $d.Site, $marca)
+    if ($apipa) {
+        Warn ("{0} tem o IP {1} (169.254 = placa de rede sem cabo ou sem IP) registrado no DNS do AD." -f $d.Name, ($apipa -join ', '))
+        Info '    PCs e o pfSense podem tentar esse IP e falhar. Corrija no DC: desative a placa sem uso, ou'
+        Info '    nas propriedades dela > IPv4 > Avancado > DNS, desmarque "Registrar os enderecos desta conexao no DNS".'
+        Info '    Depois: ipconfig /registerdns e apague o registro 169.254 no Gerenciador de DNS.'
+    }
 }
-$n = Read-Valor 'Numero do controlador' "$padraoDc" { param($v) $v -match '^\d+$' -and [int]$v -ge 1 -and [int]$v -le $dcs.Count } "digite um numero de 1 a $($dcs.Count)."
-$dc = $dcs[[int]$n - 1]
+$escolha = Read-Valor 'Controlador (numero ou nome)' "$padraoDc" {
+    param($v) ($v -match '^\d+$' -and [int]$v -ge 1 -and [int]$v -le $dcs.Count) -or
+              @($dcs | Where-Object { $_.Name -ieq $v -or $_.HostName -ieq $v }).Count -eq 1
+} "digite o numero (1 a $($dcs.Count)) ou o nome do controlador."
+$dc = if ($escolha -match '^\d+$') { $dcs[[int]$escolha - 1] } else { $dcs | Where-Object { $_.Name -ieq $escolha -or $_.HostName -ieq $escolha } | Select-Object -First 1 }
 $dcHost = [string]$dc.HostName
-$dcIp   = [string]$dc.IPv4Address
+$ips = @($ipsDc[$dcHost])
+Info 'IP do controlador que o pfSense vai usar (normalmente o da LAN, ex.: 172.16.10.x):'
+$dcIp = Read-Valor 'IP do controlador' $(if ($ips.Count) { $ips[0] } else { '' }) {
+    param($v) $v -match '^((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)$' -and $v -notlike '169.254.*' -and $v -notlike '127.*'
+} 'digite o IPv4 da LAN do controlador (nao vale 169.254.x.x nem 127.x.x.x).'
 Ok "controlador: $dcHost ($dcIp)"
 
 # ------------------------------ 3. LDAPS -------------------------------
