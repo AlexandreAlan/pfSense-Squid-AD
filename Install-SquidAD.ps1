@@ -15,8 +15,10 @@
       5. cria (ou reaproveita) a conta de servico SO LEITURA usada pelo pfSense
       6. testa o LDAP com essa conta - e, se quiser, com um usuario real
       7. (opcional) cria a GPO que configura o proxy nos PCs
-      8. gera o arquivo squid-ad-<DOMINIO>.json para o script do pfSense
-      9. (opcional) tarefa agendada que mantem os grupos em dia a cada 15 min
+      8. (opcional) instala no pfSense uma chave SSH restrita aos comandos "ssl-*"
+         (fase 2: inspecao SSL), para este servidor poder rodar la sem ter a senha admin
+      9. gera o arquivo squid-ad-<DOMINIO>.json para o script do pfSense
+     10. (opcional) tarefa agendada que mantem os grupos em dia a cada 15 min
 
     No fim mostra a senha da conta de servico (quando ela foi criada/trocada)
     para o administrador guardar no cofre de senhas.
@@ -61,7 +63,7 @@ $PadraoSetor = '^(SETOR|SET|DEP|DEPTO|DEPARTAMENTO|GRP|GG|GS)[-_ .]'
 
 # ------------------------------ helpers -------------------------------
 $script:Passo = 0
-$script:TotalPassos = 9
+$script:TotalPassos = 10
 # Cabecalho de passo: numerado e separado por linhas, para a pessoa saber onde esta.
 function Step([string]$m) {
     $script:Passo++
@@ -130,6 +132,62 @@ function New-SenhaForte([int]$Tamanho = 32) {
     $s = -join ($bytes | ForEach-Object { $chars[$_ % $chars.Length] })
     # garante maiuscula, minuscula, numero e simbolo (politica de senha do AD)
     return 'Aa1-' + $s.Substring(4)
+}
+
+# Chave SSH restrita (fase 2: inspecao SSL) no pfSense, so para os comandos "ssl-*" - nunca
+# da senha admin completa para a automacao, so uma chave que o pfSense aceita rodar com elas.
+# A senha admin do pfSense e usada SO aqui, na hora, para instalar a chave; nunca e salva.
+function Install-SquidSslAcessoRemoto {
+    $dirChave = Join-Path $env:ProgramData 'pfSense-Squid-AD'
+    if (-not (Test-Path $dirChave)) { New-Item -ItemType Directory -Force $dirChave | Out-Null }
+    & icacls.exe $dirChave /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C /Q | Out-Null
+
+    $ipFw = Read-Valor 'IP (ou nome) do pfSense' '' { param($v) -not [string]::IsNullOrWhiteSpace($v) } 'informe o IP ou nome do pfSense.'
+    $portaFw = Read-Valor 'Porta do SSH do pfSense' '22' { param($v) $v -match '^\d+$' } 'porta numerica.'
+    $userFw = Read-Valor 'Usuario do pfSense que vai receber a chave restrita' 'admin'
+
+    $arqChave = Join-Path $dirChave 'ssl-remoto'
+    if (Test-Path $arqChave) {
+        Warn "ja existe uma chave em $arqChave; reaproveitando (apague o arquivo para gerar uma nova)."
+    } else {
+        & ssh-keygen.exe -t ed25519 -f $arqChave -N '""' -C 'squid-ad-ssl@ad' -q
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $arqChave)) { throw 'ssh-keygen falhou (o OpenSSH Client do Windows esta instalado?).' }
+        Ok "chave gerada: $arqChave (privada) / $arqChave.pub (publica)"
+    }
+
+    if (-not (Get-Module -ListAvailable -Name Posh-SSH)) {
+        Warn 'modulo Posh-SSH nao encontrado - nao consigo instalar a chave automaticamente agora.'
+        Info 'instale com: Install-Module Posh-SSH -Scope CurrentUser'
+        Info 'ou faca manualmente, por SSH admin no pfSense (ver docs/pfsense.md):'
+        Info "  1. envie $arqChave.pub para o pfSense"
+        Info "  2. php /root/squid-ad.php ssl-chave-remota $userFw <arquivo.pub>"
+        return [ordered]@{ ChavePrivada = $arqChave; Instalada = $false }
+    }
+    Import-Module Posh-SSH -ErrorAction Stop
+
+    $senhaAdmin = Read-Host "    Senha ADMIN do pfSense (usuario '$userFw', so usada agora, nao e salva)" -AsSecureString
+    $cred = New-Object System.Management.Automation.PSCredential($userFw, $senhaAdmin)
+    $ssh = $null; $sftp = $null
+    try {
+        $ssh = New-SSHSession -ComputerName $ipFw -Port $portaFw -Credential $cred -AcceptKey -ErrorAction Stop
+        $sftp = New-SFTPSession -ComputerName $ipFw -Port $portaFw -Credential $cred -AcceptKey -ErrorAction Stop
+        Set-SFTPFile -SessionId $sftp.SessionId -LocalFile "$arqChave.pub" -RemotePath '/tmp/ssl-remoto.pub' -Overwrite | Out-Null
+        $scriptLocal = Join-Path $Aqui 'pfsense\squid-ad.php'
+        if (Test-Path $scriptLocal) {
+            Set-SFTPFile -SessionId $sftp.SessionId -LocalFile $scriptLocal -RemotePath '/tmp/squid-ad.php' -Overwrite | Out-Null
+        }
+        $cmd = "cp /tmp/squid-ad.php /root/squid-ad.php 2>/dev/null; /usr/local/bin/php /root/squid-ad.php ssl-chave-remota $userFw /tmp/ssl-remoto.pub --sim"
+        $saida = Invoke-SSHCommand -SSHSession $ssh -Command $cmd
+        foreach ($l in @($saida.Output)) { Info $l }
+        if ($saida.ExitStatus -ne 0) { throw "ssl-chave-remota terminou com erro (codigo $($saida.ExitStatus)); confira a mensagem acima." }
+        Ok 'chave instalada no pfSense (acesso restrito aos comandos ssl-*).'
+    } finally {
+        if ($sftp) { Remove-SFTPSession -SessionId $sftp.SessionId -ErrorAction SilentlyContinue | Out-Null }
+        if ($ssh)  { Remove-SSHSession  -SessionId $ssh.SessionId  -ErrorAction SilentlyContinue | Out-Null }
+        $senhaAdmin = $null; $cred = $null
+    }
+    Warn 'restrinja agora o SSH desse usuario a rede interna (System > Advanced > Admin Access) - nunca deixe aberto na WAN.'
+    return [ordered]@{ ChavePrivada = $arqChave; Instalada = $true; FirewallHost = $ipFw; FirewallPorta = [int]$portaFw; FirewallUsuario = $userFw }
 }
 
 function ConvertTo-Pem([byte[]]$Der) {
@@ -714,7 +772,22 @@ if (Read-SimNao 'Criar a GPO que configura o proxy nos PCs?' $false) {
     } else { Info 'sem vinculo: ligue depois em Gerenciamento de Politica de Grupo.' }
 }
 
-# --------------------------- 8. arquivo ---------------------------------
+# ---------------- 7b. acesso remoto para a inspecao SSL (opcional) -----------------
+Step 'Acesso remoto ao pfSense para a inspecao SSL (opcional)'
+Explicar -OQue 'Uma chave SSH restrita, instalada no pfSense, so para os comandos "ssl-*" (fase 2: inspecao SSL).' `
+         -PorQue @('Hoje o Servidor AD nao tem nenhum acesso ao firewall; so um humano com a senha',
+                   'admin consegue rodar "ssl-aplicar" (System > Cert. Manager / Services > Squid).',
+                   'Essa chave deixa isso automatizavel sem dar a senha admin completa para a automacao.') `
+         -Acontece @('Gera uma chave SSH aqui no Servidor AD, pede a senha ADMIN do pfSense SO AGORA',
+                     '(nunca e salva) e manda o pfSense instalar o acesso restrito: so os comandos',
+                     'ssl-simular/ssl-aplicar/ssl-testar/ssl-status/ssl-desfazer passam por essa chave,',
+                     'mesmo que o shell do pfSense seja root. Precisa do modulo PowerShell Posh-SSH.')
+$sslRemoto = $null
+if (Read-SimNao 'Configurar agora o acesso remoto para a inspecao SSL?' $false) {
+    $sslRemoto = Install-SquidSslAcessoRemoto
+}
+
+# --------------------------- 9. arquivo ---------------------------------
 Step 'Arquivo para o pfSense'
 Explicar -OQue "O arquivo squid-ad-$($dom.NetBIOSName).json, com tudo que o script do pfSense precisa." `
          -PorQue 'Leva servidor, conta, setores e a CA do LDAPS: nada para digitar no pfSense.' `
@@ -732,7 +805,7 @@ Ok "gravado: $OutFile"
 if ($incluiSenha) { Warn 'o arquivo tem a senha da conta de servico: apague-o depois de usar no pfSense.' }
 $svcSenha = $null
 
-# --------------------- 9. sincronizacao automatica ----------------------
+# --------------------- 10. sincronizacao automatica ----------------------
 if ($sync) {
     Step 'Sincronizacao automatica (opcional)'
     Explicar -OQue 'Uma tarefa agendada no Windows (a cada 15 min, como SYSTEM).' `
@@ -767,6 +840,14 @@ Write-Host '    1. Diagnostics > Command Prompt > Upload File: envie o squid-ad.
 Write-Host '    2. Por SSH (recomendado, interativo):'
 Write-Host "         php /tmp/squid-ad.php aplicar /tmp/$(Split-Path $OutFile -Leaf)"
 Write-Host '       ou na tela Command Prompt (sem perguntas): primeiro "simular", depois "aplicar ... --sim"'
+if ($sslRemoto) {
+    if ($sslRemoto.Instalada) {
+        Write-Host "    3. Inspecao SSL: chave instalada em $($sslRemoto.FirewallUsuario)@$($sslRemoto.FirewallHost):$($sslRemoto.FirewallPorta)."
+        Write-Host "       Teste com: ssh -i $($sslRemoto.ChavePrivada) $($sslRemoto.FirewallUsuario)@$($sslRemoto.FirewallHost) -p $($sslRemoto.FirewallPorta) ssl-status"
+    } else {
+        Write-Host "    3. Inspecao SSL: chave gerada em $($sslRemoto.ChavePrivada), mas NAO instalada no pfSense ainda (ver aviso acima)."
+    }
+}
 
 # --------------------------- senha gerada --------------------------------
 # Por ultimo, para ser a ultima coisa na tela.
